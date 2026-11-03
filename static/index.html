@@ -1,0 +1,74 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>日记账 BI 系统</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css?v=1.3.2">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="logo">📒 日记账<span class="logo-sub">BI 系统</span></div>
+    <div class="company-wrap">
+      <label class="side-label">当前公司</label>
+      <div class="company-row">
+        <select id="companySelect" class="inp"></select>
+        <button class="btn sm primary company-add" data-action="comp-add" title="新建公司">＋</button>
+      </div>
+    </div>
+    <nav id="nav">
+      <button class="nav-btn active" data-action="nav" data-view="dashboard">📊 总览看板</button>
+      <button class="nav-btn" data-action="reminders">🔔 待办提醒</button>
+      <button class="nav-btn" data-action="agent-toggle" id="navAgent">🤖 AI 查账助手</button>
+      <button class="nav-btn" data-action="nav" data-view="journal">📖 日记账</button>
+      <button class="nav-btn" data-action="nav" data-view="cash">💵 现金管理</button>
+      <button class="nav-btn" data-action="nav" data-view="deposits">💰 定期存款</button>
+      <button class="nav-btn" data-action="nav" data-view="tags">🏷️ 标签管理</button>
+      <button class="nav-btn" data-action="nav" data-view="orgs">🏢 公司与账户</button>
+      <button class="nav-btn" data-action="nav" data-view="settings">⚙️ 设置</button>
+    </nav>
+    <div class="side-foot">
+      数据保存在本机<br>data\journal.db 与 data\uploads\<br>设置页可一键备份
+    </div>
+  </aside>
+  <main id="main">
+    <header id="topbar">
+      <div id="viewTitle">总览看板</div>
+      <div class="topbar-tools">
+        <input id="globalSearch" class="inp" placeholder="🔍 全局搜索：摘要 / 单据号 / 对方单位 / 项目 …  (回车)">
+        <button class="btn primary" data-action="master-export" title="全量导出：目录 + 每个账户一个工作表 + 定期存款">📤 全量导出</button>
+      </div>
+    </header>
+    <div id="content"></div>
+  </main>
+</div>
+<div id="modalOverlay" class="hidden"><div id="modalBox"></div></div>
+
+<!-- AI 查账助手（右侧抽屉，随时可唤起） -->
+<button id="agentFab" class="agent-fab" data-action="agent-toggle" title="AI 查账助手（Alt+A）">🤖</button>
+<aside id="agentDock" class="agent-dock" aria-hidden="true">
+  <div class="agent-grip" id="agentGrip" title="拖动调整宽度"></div>
+  <div class="agent-head">
+    <div class="agent-head-l">
+      <b>🤖 查账助手</b>
+      <span class="muted small" id="agentModelHint"></span>
+    </div>
+    <div class="row" style="gap:6px;flex-wrap:nowrap">
+      <button class="btn sm" data-action="agent-settings" title="模型设置">⚙️</button>
+      <button class="btn sm" data-action="agent-clear" title="清空对话">🗑</button>
+      <button class="btn sm" data-action="agent-close" title="收起（Esc）">✕</button>
+    </div>
+  </div>
+  <div class="agent-chat" id="agentChat"></div>
+  <div class="agent-quick" id="agentQuick"></div>
+  <div class="agent-inputbar">
+    <textarea id="agentInput" rows="1" placeholder="问点什么，例如：上个月 MOP 支票户支出最多的是哪几笔？（Enter 发送，Shift+Enter 换行）"></textarea>
+    <button class="btn primary" id="agentSend" data-action="agent-send">发送</button>
+  </div>
+</aside>
+
+<script src="app.js?v=1.4.0"></script>
+</body>
+</html>

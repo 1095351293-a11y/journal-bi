@@ -1,0 +1,31 @@
+# ---- 数据（绝不入库）----
+data/journal.db
+data/journal.db-journal
+data/agent_config.json
+data/uploads/
+data/*.xlsx
+data/_t_*
+
+# 只保留占位文件，保证 data/ 目录存在
+!data/.gitkeep
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 本地临时 ----
+*.log
+.screenshots/
+.backup*/
+node_modules/
