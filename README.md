@@ -1,6 +1,6 @@
-# 银行日记账 BI 系统
+# 日记账 BI 系统
 
-> 一个「拷贝文件夹就能跑」的本地银行日记账 + 资金看板工具。纯 Flask + SQLite，前端零框架、零构建、零 CDN，全部数据留在你自己的电脑上。
+> 一个「拷贝文件夹就能跑」的本地日记账 + 资金看板工具。纯 Flask + SQLite，前端零框架、零构建、零 CDN，全部数据留在你自己的电脑上。
 
 **Bank Journal BI** — a self-hosted, single-folder bank journal & treasury dashboard for small finance teams. Built with Flask + SQLite, no build step, no cloud, no telemetry. Multi-company, multi-currency, AI-assisted natural-language querying.
 
