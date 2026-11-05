@@ -407,6 +407,152 @@ def t_list_cash_counts(args):
     return {'cash_counts': rr, 'count': len(rr)}, links
 
 
+def t_data_overview(args):
+    """一次调用拿全库概况：几家公司、几个账户、流水区间与规模 —— 替代
+    list_companies + list_accounts 两步试探，省一轮往返。"""
+    comps = rows('SELECT c.id, c.name, COUNT(a.id) accs '
+                 'FROM companies c LEFT JOIN accounts a ON a.company_id=c.id '
+                 'GROUP BY c.id ORDER BY c.sort, c.id')
+    e = one('SELECT COUNT(*) n, MIN(date) mn, MAX(date) mx, '
+            'SUM(debit) d, SUM(credit) c FROM entries') or {}
+    curs = rows('SELECT currency, COUNT(*) n FROM accounts GROUP BY currency')
+    tags = one('SELECT COUNT(*) n FROM tags') or {}
+    dep = one('SELECT COUNT(*) n, SUM(principal) p FROM deposits') or {}
+    return {
+        'companies': comps, 'company_count': len(comps),
+        'account_count': sum(int(c['accs'] or 0) for c in comps),
+        'currencies': curs,
+        'entries': {'count': e.get('n') or 0, 'date_min': e.get('mn'),
+                    'date_max': e.get('mx'), 'sum_in': money(e.get('d')),
+                    'sum_out': money(e.get('c'))},
+        'tag_count': tags.get('n') or 0,
+        'deposit_count': dep.get('n') or 0,
+        'deposit_principal': money(dep.get('p')),
+    }, []
+
+
+_AGG_GROUP = {
+    'month': "substr(e.date,1,7)",
+    'party': "COALESCE(NULLIF(e.party,''),'(未填对方)')",
+    'project': "COALESCE(NULLIF(e.project,''),'(未填项目)')",
+    'account': "a.name",
+    'company': "c.name",
+    'currency': "a.currency",
+    'day': "e.date",
+}
+
+
+def t_aggregate_entries(args):
+    """按维度聚合：趋势、排名、占比一次算完，不用把几百条明细丢给模型。"""
+    gb = str(args.get('group_by') or 'month').lower()
+    expr = _AGG_GROUP.get(gb)
+    if not expr:
+        return {'error': f'group_by 只支持 {list(_AGG_GROUP)}'}, []
+    cond, p = [], []
+
+    def add_num(k, col):
+        if args.get(k):
+            cond.append(f'{col}>=?')
+            p.append(str(args[k]))
+
+    add_num('date_from', 'e.date')
+    add_num('date_to', 'e.date')
+    if args.get('company_id'):
+        cond.append('a.company_id=?')
+        p.append(int(args['company_id']))
+    if args.get('account_id'):
+        cond.append('e.account_id=?')
+        p.append(int(args['account_id']))
+    if args.get('currency'):
+        cond.append('a.currency=?')
+        p.append(str(args['currency']))
+    kw = str(args.get('keyword') or '').strip()
+    if kw:
+        cond.append('(e.description LIKE ? OR e.party LIKE ? OR e.project LIKE ?)')
+        p += [f'%{kw}%'] * 3
+    direction = str(args.get('direction') or '').lower()
+    if direction in ('in', 'income', '收', '收入'):
+        cond.append('e.debit>0')
+    elif direction in ('out', 'expense', '支', '支出'):
+        cond.append('e.credit>0')
+    if str(args.get('status') or '').lower() in ('pending', 'uncleared', '未兑现'):
+        cond.append('e.pending=1')
+    where = ('WHERE ' + ' AND '.join(cond)) if cond else ''
+    limit = max(1, min(int(args.get('limit') or 20), 60))
+    rr = rows(f'SELECT {expr} k, COUNT(*) n, SUM(e.debit) d, SUM(e.credit) c '
+              f'FROM entries e JOIN accounts a ON a.id=e.account_id '
+              f'JOIN companies c ON c.id=a.company_id {where} '
+              f'GROUP BY k ORDER BY (SUM(e.debit)-SUM(e.credit)) '
+              f'{"DESC" if str(args.get("order") or "desc").lower()!="asc" else "ASC"} '
+              f'LIMIT {limit}', p)
+    tot = one(f'SELECT SUM(e.debit) d, SUM(e.credit) c, COUNT(*) n FROM entries e '
+              f'JOIN accounts a ON a.id=e.account_id JOIN companies c ON c.id=a.company_id '
+              f'{where}', p) or {}
+    base_in, base_out = float(tot.get('d') or 0), float(tot.get('c') or 0)
+    out = []
+    for r in rr:
+        din, cout = float(r['d'] or 0), float(r['c'] or 0)
+        out.append({
+            'key': r['k'], 'count': r['n'],
+            'in': money(din), 'out': money(cout), 'net': money(din - cout),
+            # 占比按「该方向金额」算：支出的行就占总支出的比例
+            'share_out': round(cout / base_out * 100, 2) if base_out else 0,
+            'share_in': round(din / base_in * 100, 2) if base_in else 0,
+        })
+    return {'group_by': gb, 'rows': out, 'returned': len(out),
+            'total': {'count': tot.get('n') or 0, 'in': money(base_in),
+                      'out': money(base_out), 'net': money(base_in - base_out)}}, []
+
+
+def t_compare_periods(args):
+    """两期对比：本期 vs 上期，按币种拆开，直接给变动率。"""
+    def span(a, b):
+        cond, p = [], []
+        if a:
+            cond.append('e.date>=?')
+            p.append(str(a))
+        if b:
+            cond.append('e.date<=?')
+            p.append(str(b))
+        if args.get('company_id'):
+            cond.append('a.company_id=?')
+            p.append(int(args['company_id']))
+        w = ('WHERE ' + ' AND '.join(cond)) if cond else ''
+        return rows(f'SELECT a.currency cur, COUNT(*) n, SUM(e.debit) d, SUM(e.credit) c '
+                    f'FROM entries e JOIN accounts a ON a.id=e.account_id '
+                    f'JOIN companies c ON c.id=a.company_id {w} '
+                    f'GROUP BY a.currency', p)
+
+    def pack(rs):
+        return {r['cur']: {'count': r['n'], 'in': money(r['d']),
+                           'out': money(r['c']),
+                           'net': money((r['d'] or 0) - (r['c'] or 0))} for r in rs}
+
+    pa = span(args.get('a_from'), args.get('a_to'))
+    pb = span(args.get('b_from'), args.get('b_to'))
+    A, B = pack(pa), pack(pb)
+    out = []
+    for cur in sorted(set(A) | set(B)):
+        a = A.get(cur, {'count': 0, 'in': 0, 'out': 0, 'net': 0})
+        b = B.get(cur, {'count': 0, 'in': 0, 'out': 0, 'net': 0})
+        out.append({
+            'currency': cur,
+            'period_a': a, 'period_b': b,
+            'delta_in': money(a['in'] - b['in']),
+            'delta_out': money(a['out'] - b['out']),
+            'delta_net': money(a['net'] - b['net']),
+            'pct_out': (round((a['out'] - b['out']) / b['out'] * 100, 1)
+                        if b['out'] else None),
+            'pct_in': (round((a['in'] - b['in']) / b['in'] * 100, 1)
+                       if b['in'] else None),
+        })
+    return {'period_a': [args.get('a_from'), args.get('a_to')],
+            'period_b': [args.get('b_from'), args.get('b_to')],
+            'compare': out,
+            'note': 'period_a 为对比期（如本月），period_b 为基准期（如上月）；'
+                    'pct_* 是 period_a 相对 period_b 的变化百分比'}, []
+
+
 def t_show_links(args):
     out = []
     for l in (args.get('links') or [])[:LINK_MODEL_MAX]:
@@ -485,6 +631,47 @@ TOOLS = [
         'parameters': {'type': 'object', 'properties': {
             'company_id': {'type': 'integer'}}, 'required': []}}},
     {'type': 'function', 'function': {
+        'name': 'data_overview',
+        'description': '数据总览：有哪些公司（含 id）、账户总数、币种、流水笔数与日期区间、'
+                       '标签数、定期笔数。想知道「库里有什么 / 有几家公司 / 数据到什么时候」'
+                       '时第一个调它，能替掉 list_companies + list_accounts 两步。',
+        'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
+    {'type': 'function', 'function': {
+        'name': 'aggregate_entries',
+        'description': '按维度聚合流水，一次算完趋势/排名/占比，不必取明细回来自己加。'
+                       '适合：「每月收支趋势」「哪个对方单位支出最多」「各项目占比」'
+                       '「Top 10 大额支出」「哪些账户流水最多」。',
+        'parameters': {'type': 'object', 'properties': {
+            'group_by': {'type': 'string',
+                         'enum': ['month', 'day', 'party', 'project',
+                                  'account', 'company', 'currency'],
+                         'description': 'month=按月，party=按对方单位，project=按项目，'
+                                        'account=按账户，company=按公司，currency=按币种'},
+            'company_id': {'type': 'integer'},
+            'account_id': {'type': 'integer'},
+            'currency': {'type': 'string'},
+            'date_from': {'type': 'string', 'description': 'YYYY-MM-DD'},
+            'date_to': {'type': 'string', 'description': 'YYYY-MM-DD'},
+            'keyword': {'type': 'string'},
+            'direction': {'type': 'string', 'enum': ['in', 'out'],
+                          'description': 'out=只看支出排名，in=只看收入排名'},
+            'status': {'type': 'string', 'enum': ['all', 'booked', 'pending']},
+            'limit': {'type': 'integer', 'description': '返回前 N 组，默认 20，最大 60'},
+            'order': {'type': 'string', 'enum': ['desc', 'asc'],
+                      'description': '按净额排序方向，默认 desc（净流入多在前）'}},
+            'required': ['group_by']}}},
+    {'type': 'function', 'function': {
+        'name': 'compare_periods',
+        'description': '两期对比：本期(a_*) 与基准期(b_*) 的收入/支出/净额差异及变动百分比，'
+                       '按币种分列。适合「这个月比上个月花得多了多少」「同比怎么样」。',
+        'parameters': {'type': 'object', 'properties': {
+            'a_from': {'type': 'string', 'description': '本期起 YYYY-MM-DD'},
+            'a_to': {'type': 'string', 'description': '本期止 YYYY-MM-DD'},
+            'b_from': {'type': 'string', 'description': '基准期起 YYYY-MM-DD'},
+            'b_to': {'type': 'string', 'description': '基准期止 YYYY-MM-DD'},
+            'company_id': {'type': 'integer'}},
+            'required': ['a_from', 'a_to', 'b_from', 'b_to']}}},
+    {'type': 'function', 'function': {
         'name': 'show_links',
         'description': '把链接作为独立按钮推给用户。仅在用户明确要「给我链接清单 / 列个链接」时使用；'
                        '正常情况下应把链接写在回答文字里（[文字](#entry:流水id:账户id)），不必调用本工具。'
@@ -509,8 +696,32 @@ TOOL_IMPL = {
     'list_deposits': t_list_deposits,
     'list_tags': t_list_tags,
     'list_cash_counts': t_list_cash_counts,
+    'data_overview': t_data_overview,
+    'aggregate_entries': t_aggregate_entries,
+    'compare_periods': t_compare_periods,
     'show_links': t_show_links,
 }
+
+TOOL_LABEL = {
+    'list_companies': '读取公司列表', 'list_accounts': '读取账户列表',
+    'query_entries': '检索流水', 'account_balance': '计算账户余额',
+    'company_summary': '汇总公司收支', 'list_deposits': '读取定期存款',
+    'list_tags': '读取标签', 'list_cash_counts': '读取现金盘点',
+    'data_overview': '读取数据总览', 'aggregate_entries': '聚合统计',
+    'compare_periods': '两期对比', 'show_links': '推送链接',
+}
+
+# 写入工具（只生成草稿，落库要用户点确认）——单独一层，查询时可整体关掉
+try:
+    from agent_write import WRITE_IMPL, WRITE_LABELS, WRITE_TOOLS
+    TOOLS.extend(WRITE_TOOLS)
+    TOOL_IMPL.update(WRITE_IMPL)
+    TOOL_LABEL.update(WRITE_LABELS)
+except Exception as _e:      # 写入层坏了不影响查账
+    print('[agent] 写入工具未加载:', _e)
+
+WRITE_NAMES = {'propose_entry', 'propose_update_entry',
+               'propose_delete_entries', 'import_file', 'propose_import'}
 
 SYSTEM_PROMPT = """你是「日记账 BI 系统」内置的查账助手，服务对象是企业的财务人员。
 
@@ -730,13 +941,21 @@ def _summarize(name, result):
 bp = Blueprint('agent', __name__)
 
 
-@bp.get('/api/agent/config')
-def get_agent_config():
-    cfg = load_config()
+def _cfg_out(cfg):
+    """对外返回的配置：密钥脱敏 + 读图能力的实际结论。"""
+    from agent_core import vision_capable      # 延迟导入，避免循环依赖
     safe = dict(cfg)
     safe['api_key'] = mask_key(cfg.get('api_key') or '')
     safe['has_key'] = bool((cfg.get('api_key') or '').strip())
-    return jsonify({'config': safe, 'presets': PRESETS})
+    safe['vision'] = vision_capable(cfg)
+    safe['vision_guess'] = vision_capable({'model': cfg.get('model')})
+    return safe
+
+
+@bp.get('/api/agent/config')
+def get_agent_config():
+    cfg = load_config()
+    return jsonify({'config': _cfg_out(cfg), 'presets': PRESETS})
 
 
 @bp.post('/api/agent/config')
@@ -751,6 +970,8 @@ def set_agent_config():
         # 前端回传掩码值＝不修改
         if '****' not in k:
             cfg['api_key'] = k.strip()
+    if 'vision' in data and data['vision'] is not None:
+        cfg['vision'] = bool(data['vision'])
     for k, lo, hi in (('temperature', 0, 2), ('max_rounds', 1, 12),
                       ('timeout', 10, 300)):
         if k in data:
@@ -763,10 +984,59 @@ def set_agent_config():
     if not cfg.get('model'):
         return jsonify({'error': '模型名不能为空'}), 400
     save_config(cfg)
-    safe = dict(cfg)
-    safe['api_key'] = mask_key(cfg.get('api_key') or '')
-    safe['has_key'] = bool((cfg.get('api_key') or '').strip())
-    return jsonify({'ok': True, 'config': safe})
+    return jsonify({'ok': True, 'config': _cfg_out(cfg)})
+
+
+@bp.post('/api/agent/vision-test')
+def test_vision():
+    """真打一次带图片的请求，判断模型到底能不能读图（不靠模型名猜）。"""
+    import base64
+    import io
+
+    cfg = load_config()
+    data = request.get_json(silent=True) or {}
+    for k in ('base_url', 'model'):
+        if data.get(k):
+            cfg[k] = str(data[k]).strip()
+    k = str(data.get('api_key') or '')
+    if k and '****' not in k:
+        cfg['api_key'] = k.strip()
+    cfg['timeout'] = 40
+
+    from agent_core import llm_stream
+    try:                                       # 造一张写着已知金额的图
+        from PIL import Image, ImageDraw
+        im = Image.new('RGB', (460, 130), 'white')
+        d = ImageDraw.Draw(im)
+        d.rectangle([14, 14, 446, 116], outline='black', width=2)
+        d.text((34, 30), 'VISION TEST', fill='black')
+        d.text((34, 68), 'AMOUNT MOP 8,642.35', fill='black')
+        buf = io.BytesIO()
+        im.save(buf, 'PNG')
+        b64 = base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        b64 = ('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8'
+               'z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==')
+    content = [
+        {'type': 'text', 'text': '图里的 AMOUNT 是多少？只回数字，不要解释。'},
+        {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + b64}},
+    ]
+    text, err = '', ''
+    try:
+        for kind, val in llm_stream(cfg, [{'role': 'user', 'content': content}], None):
+            if kind == 'text':
+                text += val or ''
+    except Exception as exc:
+        err = f'{type(exc).__name__}: {exc}'
+    low = (text or '').lower()
+    ok = bool(err == '' and ('8642' in low.replace(',', '').replace(' ', '')))
+    if ok:                                     # 实测通过就直接写进配置
+        clean = load_config()
+        clean['vision'] = True
+        save_config(clean)
+    return jsonify({'ok': ok, 'reply': (text or '').strip()[:200],
+                    'error': err[:300],
+                    'model': cfg.get('model')})
 
 
 @bp.post('/api/agent/test')

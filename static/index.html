@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>日记账 BI 系统</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="style.css?v=1.3.2">
+<link rel="stylesheet" href="style.css?v=2.6.0">
 </head>
 <body>
 <div id="app">
@@ -50,25 +50,42 @@
 <button id="agentFab" class="agent-fab" data-action="agent-toggle" title="AI 查账助手（Alt+A）">🤖</button>
 <aside id="agentDock" class="agent-dock" aria-hidden="true">
   <div class="agent-grip" id="agentGrip" title="拖动调整宽度"></div>
+  <div class="agent-side" id="agentSide"></div>
+  <div class="agent-main">
   <div class="agent-head">
     <div class="agent-head-l">
+      <button class="btn sm" data-action="agent-side" title="历史对话（新建 / 切换 / 删除）">☰</button>
       <b>🤖 查账助手</b>
       <span class="muted small" id="agentModelHint"></span>
     </div>
     <div class="row" style="gap:6px;flex-wrap:nowrap">
       <button class="btn sm" data-action="agent-settings" title="模型设置">⚙️</button>
-      <button class="btn sm" data-action="agent-clear" title="清空对话">🗑</button>
+      <button class="btn sm" data-action="agent-new" title="新建对话">＋</button>
       <button class="btn sm" data-action="agent-close" title="收起（Esc）">✕</button>
     </div>
   </div>
   <div class="agent-chat" id="agentChat"></div>
   <div class="agent-quick" id="agentQuick"></div>
+  <div class="agent-atts" id="agentAtts" style="display:none"></div>
   <div class="agent-inputbar">
-    <textarea id="agentInput" rows="1" placeholder="问点什么，例如：上个月 MOP 支票户支出最多的是哪几笔？（Enter 发送，Shift+Enter 换行）"></textarea>
+    <input type="file" id="agentFile" multiple accept=".png,.jpg,.jpeg,.webp,.gif,.bmp,.csv,.tsv,.txt,.md,.json,.xlsx,.xls,.pdf,.docx">
+    <button class="ag-icon-btn" data-action="agent-pick" title="上传图片 / Excel / PDF / CSV（也可直接拖进来，或粘贴截图）">📎</button>
+    <textarea id="agentInput" rows="1" placeholder="问点什么，例如：上个月 MOP 支票户支出最多的是哪几笔？（Enter 发送，Shift+Enter 换行；可拖入回单截图或对账单）"></textarea>
     <button class="btn primary" id="agentSend" data-action="agent-send">发送</button>
+  </div>
   </div>
 </aside>
 
-<script src="app.js?v=1.4.0"></script>
+<script src="app.js?v=2.6.0"></script>
+<script>
+/* 深链接：#agent 直接打开助手（方便收藏 / 排查问题） */
+if(/[#&]agent/.test(location.hash)){
+  setTimeout(function(){
+    try{ closeModal(); }catch(e){}
+    try{ agentOpen(); }catch(e){}
+    if(/[#&]side/.test(location.hash)){ try{ agentSideToggle(true); }catch(e){} }
+  }, 900);
+}
+</script>
 </body>
 </html>

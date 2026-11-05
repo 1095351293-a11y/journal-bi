@@ -3,6 +3,9 @@ data/journal.db
 data/journal.db-journal
 data/agent_config.json
 data/uploads/
+data/agent_uploads/
+data/agent_proposals.json
+data/agent_writes.jsonl
 data/*.xlsx
 data/_t_*
 

@@ -410,8 +410,9 @@ async function renderCash(){
       <input type="date" id="cashDate" class="inp" data-change="cash-date" value="${esc(cashDate)}" style="width:140px"></label>
     <span class="sep"></span>
     <button class="btn primary" data-action="cash-add">＋ 新建盘点</button>
+    <button class="btn" data-action="cash-export">📥 导出Excel</button>
     <button class="btn" data-action="cash-goto-journal">📖 现金流水</button>
-    <span class="hint">盘点按面额录入张数，系统自动算实有金额与差异</span>
+    <span class="hint">盘点按面额录入张数，系统自动算实有金额与差异；每行「复制」可照上一张单快速新建</span>
   </div>
 
   ${!cashAccs.length ? `<div class="card empty-hint">该公司还没有库存现金账户。去「公司与账户」新增账户，类型选<b>现金</b>（建议按币种各建一个）。</div>` : ''}
@@ -463,6 +464,7 @@ async function renderCash(){
         <td>${esc(x.supervisor||'—')}</td>
         <td style="white-space:nowrap">
           <button class="btn sm" data-action="cash-edit" data-id="${x.id}">查看/编辑</button>
+          <button class="btn sm" data-action="cash-copy" data-id="${x.id}" title="按这张单的币种、面额张数、人员新建一张">复制</button>
           <button class="btn sm danger" data-action="cash-del" data-id="${x.id}">删除</button>
         </td></tr>`;
     }).join('') || '<tr><td colspan="9" class="empty-hint">还没有盘点记录，点右上角「＋ 新建盘点」按面额录入</td></tr>'}
@@ -496,12 +498,26 @@ function cashBlockHTML(it){
   </div>`;
 }
 
-async function openCashCount(id){
+async function openCashCount(id, copyId){
   let head = {count_date:cashDate||S.today, person:'', supervisor:'', note:''};
   let items = [];
+  let src = null;                       // 复制来源单
   if(id){
     const d = await api('/api/cash/counts/'+id);
     head = d.count; items = d.items || [];
+  }else if(copyId){
+    // 复制以新增：带上原单的币种、面额张数、差异原因、人员；日期改今天，账面数按新日期重算
+    const d = await api('/api/cash/counts/'+copyId);
+    src = d.count;
+    head = {count_date:S.today, person:d.count.person || '',
+            supervisor:d.count.supervisor || '', note:''};
+    items = (d.items || []).map(it=>({...it}));
+    const b = await api(`/api/cash/book?company_id=${S.company}&date=${head.count_date}`);
+    const bookMap = {};
+    (b.accounts||[]).forEach(a=>{ bookMap[a.currency] = a.book; });
+    items.forEach(it=>{
+      if(bookMap[it.currency] !== undefined) it.prev_book = bookMap[it.currency];
+    });
   }else{
     const b = await api(`/api/cash/book?company_id=${S.company}&date=${head.count_date}`);
     items = (b.accounts||[]).map(a=>({currency:a.currency, prev_book:a.book,
@@ -512,7 +528,10 @@ async function openCashCount(id){
     return;
   }
   items.sort((a,b)=>['MOP','HKD','CNY'].indexOf(a.currency)-['MOP','HKD','CNY'].indexOf(b.currency));
-  openModal(modalHead(id?'编辑盘点单':'新建现金盘点')+`
+  const title = id ? '编辑盘点单'
+    : (src ? `复制新建盘点（来源 ${esc(src.count_date)}）` : '新建现金盘点');
+  openModal(modalHead(title)+`
+    ${src ? `<div class="hint" style="margin:-4px 0 10px">已带上原单的币种、面额张数与人员；账面数按新盘点日期重算，日期和张数请按实际改。改了日期会自动刷新账面。</div>` : ''}
     <form id="ccForm" data-id="${id||''}">
       <div class="form-grid">
         <div class="field"><label>盘点日期 *</label>
@@ -529,6 +548,8 @@ async function openCashCount(id){
         <span class="muted small">（折 MOP，按设置里的汇率）</span>
       </div>
       <div class="modal-actions">
+        ${id ? `<button type="button" class="btn" data-action="cash-export" data-id="${id}">导出这张</button>
+                <button type="button" class="btn" data-action="cash-copy" data-id="${id}">复制为新单</button>` : ''}
         <button type="button" class="btn" data-action="modal-close">取消</button>
         <button type="submit" class="btn primary">保存盘点单</button>
       </div>
@@ -538,6 +559,26 @@ async function openCashCount(id){
   $('#ccForm').addEventListener('input', e=>{
     if(e.target.classList.contains('cc-qty') || e.target.classList.contains('cc-f')) ccRecalc();
   });
+  // 复制模式下改日期：自动把「上一日账面」刷成新日期的账面余额
+  if(src){
+    const dateInp = $('#ccForm [name="count_date"]');
+    if(dateInp) dateInp.addEventListener('change', async ()=>{
+      const d = dateInp.value;
+      if(!d) return;
+      try{
+        const b = await api(`/api/cash/book?company_id=${S.company}&date=${d}`);
+        const bookMap = {};
+        (b.accounts||[]).forEach(a=>{ bookMap[a.currency] = a.book; });
+        $$('#ccForm .cc-block').forEach(blk=>{
+          const cur = blk.dataset.cur;
+          if(bookMap[cur] === undefined) return;
+          const inp = blk.querySelector('[data-f="prev_book"]');
+          if(inp) inp.value = bookMap[cur];
+        });
+        ccRecalc();
+      }catch(err){ /* 取不到就保留原值 */ }
+    });
+  }
   $('#ccForm').addEventListener('submit', async ev=>{
     ev.preventDefault();
     const f = new FormData(ev.target);
@@ -564,6 +605,38 @@ async function openCashCount(id){
       else await jpost('/api/cash/counts', body);
       closeModal(); renderCash();
     }catch(err){ alert(err.message); }
+  });
+}
+
+/* 盘点表导出：可选期间，默认全部；后端出三个工作表 */
+function openCashExport(){
+  const cn = compById(S.company)?.name || '';
+  openModal(modalHead('📥 导出盘点表')+`
+    <form id="ceForm">
+      <div class="hint" style="margin:0 0 10px;line-height:1.8">
+        导出 <b>${esc(cn)}</b> 的现金盘点表（Excel），含三个工作表：<br>
+        <b>盘点汇总</b>（一张单一行，金额折 MOP，含合计）· <b>盘点明细</b>（原币逐币种）·
+        <b>面额明细</b>（张数 × 面额）
+      </div>
+      <div class="form-grid">
+        <div class="field"><label>开始日期</label><input class="inp" type="date" name="from"></div>
+        <div class="field"><label>结束日期</label><input class="inp" type="date" name="to"></div>
+      </div>
+      <div class="hint mt">留空＝导出全部盘点记录。</div>
+      <div class="modal-actions">
+        <button type="button" class="btn" data-action="modal-close">取消</button>
+        <button type="submit" class="btn primary">开始导出</button>
+      </div>
+    </form>`);
+  modalBox.style.width = 'min(560px, 92vw)';
+  $('#ceForm').addEventListener('submit', ev=>{
+    ev.preventDefault();
+    const f = new FormData(ev.target);
+    const q = new URLSearchParams({company_id:String(S.company)});
+    if(f.get('from')) q.set('from', f.get('from'));
+    if(f.get('to')) q.set('to', f.get('to'));
+    location.href = '/api/export/cash-counts?' + q.toString();
+    closeModal();
   });
 }
 
@@ -1128,14 +1201,14 @@ function depInterest(){
 function openDepModal(id){
   const isNew=!id;
   const d = isNew
-    ? {id:null, bank:'示例银行', order_no:'', currency:'HKD', principal:'', period:'6M',
+    ? {id:null, bank:'华人银行', order_no:'', currency:'HKD', principal:'', period:'6M',
        rate:'', start_date:S.today, end_date:'', note:''}
     : null;
   const old = isNew?d:null;
   openModal(modalHead(isNew?'新增定期存款':'编辑定期存款')+`
     <form id="depForm" data-did="${id||''}">
       <div class="form-grid">
-        <div class="field"><label>银行</label><input class="inp" name="bank" value="${esc(old?old.bank:'')}" placeholder="示例银行"></div>
+        <div class="field"><label>银行</label><input class="inp" name="bank" value="${esc(old?old.bank:'')}" placeholder="华人银行"></div>
         <div class="field"><label>定单号</label><input class="inp" name="order_no" value="${esc(old?old.order_no:'')}"></div>
         <div class="field"><label>币别</label><input class="inp" name="currency" value="${esc(old?old.currency:'HKD')}"></div>
         <div class="field"><label>本金</label><input class="inp" type="number" step="0.01" name="principal" value="${old?old.principal:''}"></div>
@@ -1283,7 +1356,7 @@ async function openAccModal(companyId, accId){
   openModal(modalHead(accId?'编辑账户':'添加账户')+`
     <form id="accForm">
       <div class="form-grid">
-        <div class="field full"><label>账户名称 *</label><input class="inp" name="name" value="${esc(a.name)}" placeholder="如：示例银行葡币支票户" required></div>
+        <div class="field full"><label>账户名称 *</label><input class="inp" name="name" value="${esc(a.name)}" placeholder="如：澳门华人银行葡币支票户" required></div>
         <div class="field"><label>账户类型</label>
           <select class="inp" name="kind" id="accKind">
             <option value="bank" ${a.kind!=='cash'?'selected':''}>🏦 银行账户</option>
@@ -1292,7 +1365,7 @@ async function openAccModal(companyId, accId){
         <div class="field"><label>币别 *</label><input class="inp" name="currency" value="${esc(a.currency)}" placeholder="MOP / HKD / CNY / USD…"></div>
         <div class="field"><label>期初余额</label><input class="inp" type="number" step="0.01" name="opening" value="${a.opening||''}"></div>
         <div class="field"><label>期初日期（现金用）</label><input class="inp" type="date" name="opening_date" value="${esc(a.opening_date||'')}"></div>
-        <div class="field"><label>银行</label><input class="inp" name="bank" value="${esc(a.bank)}" placeholder="示例银行 / 现金库"></div>
+        <div class="field"><label>银行</label><input class="inp" name="bank" value="${esc(a.bank)}" placeholder="澳门华人银行 / 现金库"></div>
         <div class="field"><label>账号</label><input class="inp" name="account_no" value="${esc(a.account_no)}"></div>
       </div>
       <div class="modal-actions">
@@ -1740,23 +1813,87 @@ async function globalSearch(q){
 /* ================================================================
    AI 助手（自然语言查账 + 链接弹出）
 ================================================================ */
-S.agent = { msgs: [], cfg: null, presets: [], busy: false };
+S.agent = { msgs: [], cfg: null, presets: [], busy: false, atts: [], abort: null };
 
+const AG_SESS_KEY = 'journal_agent_sessions';
+const AG_ACTIVE_KEY = 'journal_agent_active';
+const AG_SIDE_KEY = 'journal_agent_side';
+
+function agNewId(){
+  return 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+function agTime(ts){
+  if(!ts) return '';
+  const d = new Date(ts), n = new Date();
+  const p2 = x => String(x).padStart(2, '0');
+  const sameDay = d.toDateString() === n.toDateString();
+  return sameDay ? `${p2(d.getHours())}:${p2(d.getMinutes())}`
+                 : `${d.getMonth() + 1}-${p2(d.getDate())}`;
+}
+function agTitle(msgs){
+  const u = (msgs || []).find(m => m.role === 'user' && m.content);
+  if(!u) return '新对话';
+  return u.content.replace(/\s+/g, ' ').trim().slice(0, 26) || '新对话';
+}
+function agSlimMsgs(msgs){
+  return (msgs || []).slice(-60).map(m => ({
+    role: m.role, content: m.content || '', error: m.error || false,
+    links: (m.links || []).slice(0, 20),
+    steps: (m.steps || []).slice(0, 10).map(s => ({label:s.label, name:s.name,
+      ms:s.ms, summary:(s.summary||'').slice(0,300), ok:s.ok, state:s.state})),
+    thinking: (m.thinking || '').slice(-2000),
+    proposals: (m.proposals || []).map(p => ({
+      pid: p.pid, kind: p.kind, title: p.title, status: p.status,
+      danger: p.danger, warnings: (p.warnings || []).slice(0, 6),
+      items: (p.items || []).slice(0, 200), result: p.result,
+      ack: p.ack, at: p.at,
+    })),
+    route: m.route, turns: m.turns, ms: m.ms, atts: m.atts,
+    model: m.model, ts: m.ts,
+  }));
+}
+function agentLoadSessions(){
+  let arr = null;
+  try{ arr = JSON.parse(localStorage.getItem(AG_SESS_KEY) || 'null'); }catch(e){}
+  if(!Array.isArray(arr) || !arr.length){
+    // 老版本只存了一个扁平数组，迁移成第一个会话
+    let old = [];
+    try{ old = JSON.parse(localStorage.getItem('journal_agent_chat') || '[]'); }catch(e){}
+    arr = [];
+    if(Array.isArray(old) && old.length){
+      arr.push({id: agNewId(), title: agTitle(old), ts: Date.now(), msgs: old});
+    }
+  }
+  return arr.slice(0, 50);
+}
 function agentLoadMsgs(){
-  try{
-    const a = JSON.parse(localStorage.getItem('journal_agent_chat')||'[]');
-    return Array.isArray(a) ? a.slice(-80) : [];
-  }catch(e){ return []; }
+  S.agent.sessions = agentLoadSessions();
+  let sid = null;
+  try{ sid = localStorage.getItem(AG_ACTIVE_KEY); }catch(e){}
+  if(!sid || !S.agent.sessions.find(s => s.id === sid)){
+    sid = S.agent.sessions.length ? S.agent.sessions[0].id : agNewId();
+    if(!S.agent.sessions.length){
+      S.agent.sessions.push({id: sid, title: '新对话', ts: Date.now(), msgs: []});
+    }
+  }
+  S.agent.sid = sid;
+  const cur = S.agent.sessions.find(s => s.id === sid);
+  return cur ? (cur.msgs || []).slice(-80) : [];
 }
 function agentSaveMsgs(){
   try{
-    const slim = S.agent.msgs.slice(-60).map(m => ({
-      role: m.role, content: m.content || '', error: m.error || false,
-      links: (m.links || []).slice(0, 20),
-      steps: (m.steps || []).slice(0, 8),
-      model: m.model, ts: m.ts,
-    }));
-    localStorage.setItem('journal_agent_chat', JSON.stringify(slim));
+    const ss = S.agent.sessions || [];
+    let cur = ss.find(s => s.id === S.agent.sid);
+    if(!cur){
+      cur = {id: S.agent.sid || agNewId(), title: '新对话', ts: Date.now(), msgs: []};
+      S.agent.sid = cur.id;
+      ss.unshift(cur);
+    }
+    cur.msgs = agSlimMsgs(S.agent.msgs);
+    cur.ts = Date.now();
+    if(!cur.title || cur.title === '新对话') cur.title = agTitle(cur.msgs);
+    localStorage.setItem(AG_SESS_KEY, JSON.stringify(ss.slice(0, 50)));
+    localStorage.setItem(AG_ACTIVE_KEY, S.agent.sid);
   }catch(e){}
 }
 
@@ -1942,6 +2079,18 @@ function agentCfgCardHTML(cfg){
     <input id="agRounds" class="inp" style="width:80px" type="number" step="1" min="1" max="12" value="${cfg.max_rounds}">
     <label class="ag-lab">超时(秒)</label>
     <input id="agTimeout" class="inp" style="width:90px" type="number" step="5" min="10" max="300" value="${cfg.timeout}">
+  </div>
+  <div class="row mt" style="gap:10px;flex-wrap:wrap;align-items:center">
+    <label class="small" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+      <input type="checkbox" id="agVision" ${cfg.vision?'checked':''}>
+      该模型支持读图（视觉，可直接看回单/截图）
+    </label>
+    <span class="muted small">${cfg.vision === cfg.vision_guess
+      ? '（按模型名自动判定）' : '（已手动指定，覆盖自动判定）'}</span>
+    <button class="btn sm" data-action="agent-vision-test">实测读图</button>
+    <span class="small" id="agVisionMsg"></span>
+  </div>
+  <div class="row mt" style="gap:10px;flex-wrap:wrap">
     <button class="btn primary" data-action="agent-save">保存</button>
     <button class="btn" data-action="agent-test">测试连接</button>
     <span class="small" id="agTestMsg"></span>
@@ -1974,6 +2123,7 @@ function agentCfgForm(){
     temperature: +($('#agTemp')?.value || 0),
     max_rounds: +($('#agRounds')?.value || 6),
     timeout: +($('#agTimeout')?.value || 90),
+    vision: !!$('#agVision')?.checked,
   };
 }
 
@@ -1986,31 +2136,194 @@ const AGENT_QUICK = [
   '列出最大的 10 笔支出',
   '定期存款哪几笔快到期了？',
 ];
+
+/* 阶段徽章：告诉用户这次为什么查库 / 为什么没查 */
+function agRouteHTML(m){
+  const r = m.route;
+  if(!r || !r.label) return '';
+  const icon = r.mode === 'agent' ? '🔍' : r.mode === 'direct' ? '💬' : '🧠';
+  const tools = (r.tools || []).length ? ` · ${r.tools.slice(0,3).join('/')}` : '';
+  return `<div class="ag-route ${esc(r.mode)}">${icon} ${esc(r.label)}${esc(tools)}</div>`;
+}
+/* 思考过程：流式中展开，结束后折叠 */
+function agThinkHTML(m, live){
+  const t = (m.thinking || '').trim();
+  if(!t) return '';
+  if(live){
+    return `<div class="ag-think-live">
+      <div class="ag-tl-head"><span class="spin"></span>思考中…</div>
+      <div class="ag-think-body">${esc(t)}<span class="ag-cursor"></span></div></div>`;
+  }
+  const secs = m.ms ? Math.max(1, Math.round((m.thinkMs || m.ms) / 1000)) : 0;
+  return `<details class="ag-think"><summary>💭 思考过程${secs?` · ${secs}s`:''}</summary>
+    <div class="ag-think-body">${esc(t)}</div></details>`;
+}
+/* 工具调用卡片 */
+function agStepsHTML(m){
+  const ss = m.steps || [];
+  if(!ss.length) return '';
+  return `<div class="ag-tools">${ss.map(s=>{
+    const run = s.state === 'run';
+    const cls = run ? 'running' : (s.ok === false ? 'bad' : 'done');
+    const ico = run ? '<span class="spin"></span>' : (s.ok === false ? '⚠️' : '✓');
+    const ms = (!run && s.ms != null) ? `<span class="ag-tool-ms">${s.ms}ms</span>` : '';
+    const sum = (!run && s.summary) ? `<div class="ag-tool-sum">${esc(s.summary)}</div>` : '';
+    return `<div class="ag-tool ${cls}"><span class="ag-tool-ico">${ico}</span>
+      <span class="ag-tool-n">${esc(s.label || s.name || '工具')}</span>${ms}${sum}</div>`;
+  }).join('')}</div>`;
+}
+function agAttsHTML(list){
+  if(!list || !list.length) return '';
+  return list.map(a => {
+    const ico = a.kind === 'image'
+      ? `<img src="${esc(a.url)}" alt="">`
+      : `<span class="ag-att-ico">${a.kind === 'sheet' ? '📊' : (a.ext === 'pdf' ? '📕' : '📄')}</span>`;
+    const kb = a.size ? `${Math.round(a.size/1024)}KB` : '';
+    return `<span class="ag-att">${ico}<span class="ag-att-n">${esc(a.name)}</span>
+      <span class="ag-att-s">${kb}</span></span>`;
+  }).join('');
+}
 function agentMsgHTML(m, idx){
   if(m.role === 'user'){
-    return `<div class="ag-msg user"><div class="ag-bubble">${esc(m.content).replace(/\n/g,'<br>')}</div></div>`;
-  }
-  if(m.pending){
-    return `<div class="ag-msg ai"><div class="ag-bubble"><span class="ag-dots"><i></i><i></i><i></i></span>
-      <span class="muted small">正在查库…</span></div></div>`;
+    const atts = (m.atts && m.atts.length)
+      ? `<div class="ag-atts" style="padding:6px 0 0">${agAttsHTML(m.atts)}</div>` : '';
+    return `<div class="ag-msg user"><div class="ag-bubble">${esc(m.content).replace(/\n/g,'<br>')}${atts}</div></div>`;
   }
   const err = m.error;
-  const body = err
-    ? `<div class="ag-err">⚠️ ${esc(m.content)}</div>`
-    : mdToHtml(m.content);
-  const steps = (m.steps || []).length ? `
-    <details class="ag-steps"><summary>🔧 调用了 ${m.steps.length} 次工具</summary>
-      ${m.steps.map(s => `<div class="ag-step"><code>${esc(s.tool)}</code>
-        <span class="muted small">${esc(s.summary||'')} · ${s.ms}ms</span></div>`).join('')}
-    </details>` : '';
+  const body = err ? `<div class="ag-err">⚠️ ${esc(m.content)}</div>`
+                   : (m.content ? mdToHtml(m.content) : '');
   const links = agentLinksHTML(m);
-  return `<div class="ag-msg ai"><div class="ag-bubble">${body}
-      ${links}${steps}
+  const meta = [];
+  if(m.turns) meta.push(`${m.turns} 轮`);
+  if(m.ms) meta.push(`${(m.ms/1000).toFixed(1)}s`);
+  return `<div class="ag-msg ai"><div class="ag-bubble">
+      ${agRouteHTML(m)}${agThinkHTML(m, false)}${agStepsHTML(m)}${body}
+      ${agPropsHTML(m, idx)}
+      ${links}
       <div class="ag-ops">
         <button class="ag-op" data-action="agent-copy" data-idx="${idx}">复制</button>
         <button class="ag-op" data-action="agent-retry" data-idx="${idx}">重新生成</button>
-        ${m.model?`<span class="muted small">${esc(m.model)}</span>`:''}
+        ${m.model?`<span class="muted small">${esc(m.model)}${meta.length?' · '+esc(meta.join(' · ')):''}</span>`:''}
       </div></div></div>`;
+}
+/* ---- 写入草稿卡片 ---- */
+const AG_PROP_KIND = {create:'新增流水', import:'批量导入', update:'修改流水',
+                      delete:'删除流水'};
+function agPropDir(it){
+  return (it.debit || it.direction === 'in') ? 'in' : 'out';
+}
+function agPropMoney(it){
+  return it.debit || it.credit || it.amount || 0;
+}
+function agPropItemsHTML(p, mi, pi){
+  const items = p.items || [];
+  const ed = !!p.editing;
+  if(p.kind === 'update'){
+    const it = items[0] || {};
+    return `<div class="ag-prop-chg">${(it.changes || []).map(c => `
+      <div class="ag-chg">
+        <span class="ag-chg-l">${esc(c.label)}</span>
+        <span class="ag-chg-f">${esc(('' + (c.from||'')).slice(0,60) || '—')}</span>
+        <span class="ag-chg-a">→</span>
+        <span class="ag-chg-t">${esc(('' + (c.to||'')).slice(0,60))}</span>
+      </div>`).join('')}
+      <div class="ag-chg-meta">${esc(it.account_name||'')} · ${esc(it.currency||'')}
+        · ${esc(it.date||'')} · #${it.entry_id}</div></div>`;
+  }
+  const rows = items.map((it, i) => {
+    const dir = agPropDir(it);
+    if(ed){
+      return `<tr>
+        <td><input class="ag-pe dt" data-mi="${mi}" data-pi="${pi}" data-i="${i}" data-k="date" value="${esc(it.date||'')}"></td>
+        <td><select class="ag-pe sel" data-mi="${mi}" data-pi="${pi}" data-i="${i}" data-k="direction">
+          <option value="out"${dir==='out'?' selected':''}>支</option>
+          <option value="in"${dir==='in'?' selected':''}>收</option></select></td>
+        <td><input class="ag-pe num" data-mi="${mi}" data-pi="${pi}" data-i="${i}" data-k="amount" value="${agPropMoney(it).toFixed(2)}"></td>
+        <td class="ag-prop-desc">
+          <input class="ag-pe" data-mi="${mi}" data-pi="${pi}" data-i="${i}" data-k="description" value="${esc(it.description||'')}" placeholder="摘要">
+          <input class="ag-pe sm2" data-mi="${mi}" data-pi="${pi}" data-i="${i}" data-k="party" value="${esc(it.party||'')}" placeholder="对方">
+        </td>
+      </tr>`;
+    }
+    return `<tr>
+      <td class="nowrap">${esc(it.date||'')}</td>
+      <td class="${dir==='in'?'green':'red'}">${dir==='in'?'收':'支'}</td>
+      <td class="num ${dir==='in'?'green':'red'}">${fmt(agPropMoney(it))}</td>
+      <td class="ag-prop-desc">
+        <div class="ag-prop-d1">${esc((it.description||'').slice(0,40) || '—')}</div>
+        ${it.party?`<div class="ag-prop-d2">${esc(it.party.slice(0,24))}</div>`:''}
+      </td>
+    </tr>`;
+  }).join('');
+  const head = '<th>日期</th><th>收支</th><th class="num">金额</th><th>摘要 / 对方</th>';
+  const sumIn = items.reduce((s, it) => s + (it.debit || (it.direction==='in' ? it.amount||0 : 0)), 0);
+  const sumOut = items.reduce((s, it) => s + (it.credit || (it.direction==='out' ? it.amount||0 : 0)), 0);
+  const total = p.kind === 'delete' ? '' : `<div class="ag-prop-sum">
+      共 <b>${items.length}</b> 笔 · 收入 <b class="green">${fmt(sumIn)}</b>
+      · 支出 <b class="red">${fmt(sumOut)}</b></div>`;
+  return `<div class="ag-prop-tbl"><table>
+      <thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>${total}`;
+}
+function agProposalHTML(p, mi, pi){
+  const st = p.status || 'pending';
+  const stTxt = {pending:'待确认', done:'已写入', undone:'已撤销',
+                 cancelled:'已取消', failed:'未写入'}[st] || st;
+  const head = `<div class="ag-prop-h">
+      <span class="ag-prop-ico">${st === 'pending' ? (p.danger ? '⚠️' : '📝') : (st === 'done' ? '✓' : '·')}</span>
+      <span class="ag-prop-t">${esc(p.title || AG_PROP_KIND[p.kind] || '写入草稿')}</span>
+      <span class="ag-prop-st ${st}">${esc(stTxt)}</span>
+    </div>`;
+  if(st !== 'pending'){
+    const r = p.result || {};
+    const line = st === 'done'
+      ? `已写入 ${r.done || 0} 笔${r.failed ? `，${r.failed} 笔失败` : ''}`
+      : st === 'undone' ? '已撤销，数据回到这次写入之前'
+      : st === 'failed' ? '没有写入任何记录'
+      : '已取消，账本没有变化';
+    return `<div class="ag-prop ${st} ${p.danger?'danger':''}">${head}
+      <div class="ag-prop-res">${esc(line)}
+        ${(r.fails||[]).length ? `<div class="muted small">${esc((r.fails||[]).slice(0,3).join('；'))}</div>`:''}
+      </div>
+      ${st === 'done' && r.wid ? `<div class="ag-prop-f">
+        <button class="btn sm" data-action="prop-undo" data-mi="${mi}" data-pi="${pi}">撤销这次写入</button>
+      </div>` : ''}</div>`;
+  }
+  const warns = (p.warnings || []).filter(Boolean);
+  const warnHTML = warns.length ? `<div class="ag-prop-warn">
+      ${warns.slice(0, 5).map(w => `<div>· ${esc(w)}</div>`).join('')}
+      ${warns.length > 5 ? `<div class="muted small">还有 ${warns.length - 5} 条提醒</div>` : ''}
+    </div>` : '';
+  const ack = p.danger ? `<label class="ag-prop-ack">
+      <input type="checkbox" class="ag-ack" data-mi="${mi}" data-pi="${pi}" ${p.ack?'checked':''}>
+      我已核对，确认删除这几笔</label>` : '';
+  const okTxt = p.danger ? `确认删除 ${(p.items||[]).length} 笔` : '确认写入';
+  return `<div class="ag-prop ${p.danger?'danger':''}">${head}
+    ${warnHTML}
+    ${agPropItemsHTML(p, mi, pi)}
+    ${ack}
+    <div class="ag-prop-f">
+      <button class="btn sm primary" data-action="prop-confirm" data-mi="${mi}" data-pi="${pi}"
+        ${p.danger && !p.ack ? 'disabled' : ''}>${okTxt}</button>
+      ${p.kind === 'create' || p.kind === 'import'
+        ? `<button class="btn sm" data-action="prop-edit" data-mi="${mi}" data-pi="${pi}">${p.editing?'完成修改':'改字段'}</button>` : ''}
+      <button class="btn sm" data-action="prop-cancel" data-mi="${mi}" data-pi="${pi}">取消</button>
+      <span class="muted small">确认前不会改动账本</span>
+    </div></div>`;
+}
+function agPropsHTML(m, idx){
+  const ps = m.proposals || [];
+  if(!ps.length) return '';
+  return ps.map((p, pi) => agProposalHTML(p, idx, pi)).join('');
+}
+/* 流式中的那条消息：局部刷新，不走全量重绘 */
+function agentLiveHTML(m){
+  const phase = m.phase ? `<div class="ag-route">⏳ ${esc(m.phase)}</div>` : '';
+  const body = m.content ? mdToHtml(m.content) : '';
+  return `<div class="ag-bubble">${agRouteHTML(m)}${phase}
+    ${agThinkHTML(m, true)}${agStepsHTML(m)}
+    <div class="ag-body-live">${body}${m.content ? '<span class="ag-cursor"></span>' : ''}</div>
+    ${agPropsHTML(m, S.agent.msgs.indexOf(m))}
+    ${agentLinksHTML(m)}</div>`;
 }
 function agentPaint(){
   const box = $('#agentChat');
@@ -2024,43 +2337,446 @@ function agentPaint(){
         查到的记录会变成下方可点击的链接，点一下就能弹出对应的流水或账户。
       </div></div>`;
   }else{
-    box.innerHTML = S.agent.msgs.map(agentMsgHTML).join('');
+    box.innerHTML = S.agent.msgs.map((m, i) => m.streaming
+      ? `<div class="ag-msg ai" id="agLive">${agentLiveHTML(m)}</div>`
+      : agentMsgHTML(m, i)).join('');
   }
   box.scrollTop = box.scrollHeight;
 }
 function agentSetBusy(v){
   S.agent.busy = v;
   const b = $('#agentSend');
-  if(b){ b.disabled = v; b.textContent = v ? '查询中…' : '发送'; }
+  if(b){
+    b.textContent = v ? '■ 停止' : '发送';
+    b.classList.toggle('stop', v);
+    b.disabled = false;
+  }
+  const f = $('#agentFile');
+  if(f) f.disabled = v;
 }
-async function agentSend(text){
-  if(S.agent.busy) return;
-  const input = $('#agentInput');
-  const msg = (text !== undefined ? text : (input?.value || '')).trim();
-  if(!msg) return;
-  if(input) input.value = '';
-  const history = S.agent.msgs
-    .filter(m => !m.pending && !m.error && (m.role === 'user' || (m.role === 'assistant' && m.content)))
-    .slice(-12).map(m => ({role:m.role, content:m.content}));
-  S.agent.msgs.push({role:'user', content:msg, ts:Date.now()});
-  S.agent.msgs.push({role:'assistant', content:'', pending:true, ts:Date.now()});
-  agentSaveMsgs(); agentPaint(); agentSetBusy(true);
+/* ---- 会话 id：服务端靠它记住「已经查过什么」 ---- */
+function agentSid(){
+  if(!S.agent.sid){
+    S.agent.sid = (S.agent.sessions && S.agent.sessions.length)
+      ? S.agent.sessions[0].id : agNewId();
+  }
+  return S.agent.sid;
+}
+/* ---- 会话历史侧栏 ---- */
+function agentPaintSessions(){
+  const box = $('#agentSide');
+  if(!box) return;
+  const ss = S.agent.sessions || [];
+  const items = ss.length ? ss.map(s => `
+    <div class="ag-side-item ${s.id === S.agent.sid ? 'on' : ''}"
+         data-action="agent-switch" data-id="${esc(s.id)}" title="${esc(s.title || '新对话')}">
+      <span class="ag-side-t">${esc(s.title || '新对话')}</span>
+      <span class="ag-side-time">${agTime(s.ts)}</span>
+      <button class="ag-side-x" data-action="agent-del-chat" data-id="${esc(s.id)}"
+        title="删除这个对话">✕</button>
+    </div>`).join('') : `<div class="ag-side-empty">还没有历史对话。<br>问一句，它就会出现在这里。</div>`;
+  box.innerHTML = `
+    <div class="ag-side-head">
+      <button class="btn sm primary" data-action="agent-new">＋ 新建对话</button>
+      <button class="btn sm" data-action="agent-clear-all" title="清空全部历史对话">🧹</button>
+    </div>
+    <div class="ag-side-list">${items}</div>`;
+}
+function agentSideToggle(force){
+  const dock = $('#agentDock');
+  if(!dock) return;
+  const open = force === undefined ? !dock.classList.contains('side-open') : !!force;
+  dock.classList.toggle('side-open', open);
+  try{ localStorage.setItem(AG_SIDE_KEY, open ? '1' : '0'); }catch(e){}
+  if(open) agentPaintSessions();
+}
+function agentNewChat(){
+  if(S.agent.busy) agentStop();
+  agentSaveMsgs();
+  const id = agNewId();
+  S.agent.sessions = S.agent.sessions || [];
+  S.agent.sessions.unshift({id, title: '新对话', ts: Date.now(), msgs: []});
+  S.agent.sid = id;
+  S.agent.msgs = [];
+  S.agent.atts = [];
+  try{ localStorage.setItem(AG_ACTIVE_KEY, id); }catch(e){}
+  agentSaveMsgs(); agentPaint(); agentPaintAtts(); agentPaintSessions();
+  const ta = $('#agentInput');
+  if(ta && !agentIsNarrow()) ta.focus();
+  if(agentIsNarrow()) agentSideToggle(false);
+}
+function agentSwitchChat(id){
+  if(!id || id === S.agent.sid) { if(agentIsNarrow()) agentSideToggle(false); return; }
+  if(S.agent.busy) agentStop();
+  agentSaveMsgs();
+  S.agent.sid = id;
+  const cur = (S.agent.sessions || []).find(s => s.id === id);
+  S.agent.msgs = cur ? (cur.msgs || []) : [];
+  S.agent.atts = [];
+  try{ localStorage.setItem(AG_ACTIVE_KEY, id); }catch(e){}
+  agentPaint(); agentPaintAtts(); agentPaintSessions();
+  if(agentIsNarrow()) agentSideToggle(false);
+}
+function agentDelChat(id){
+  const cur = (S.agent.sessions || []).find(s => s.id === id);
+  if(!cur) return;
+  if(!confirm(`删除对话「${cur.title || '新对话'}」？只删本地记录，不动账本数据。`)) return;
+  if(S.agent.busy && S.agent.sid === id) agentStop();
+  S.agent.sessions = (S.agent.sessions || []).filter(s => s.id !== id);
+  if(S.agent.sid === id){
+    const next = S.agent.sessions[0];
+    S.agent.sid = next ? next.id : agNewId();
+    if(!next){
+      S.agent.sessions.unshift({id: S.agent.sid, title: '新对话', ts: Date.now(), msgs: []});
+    }
+    S.agent.msgs = (next && next.msgs) ? next.msgs : [];
+  }
+  agentSaveMsgs(); agentPaint(); agentPaintSessions();
+}
+function agentClearAll(){
+  if(!(S.agent.sessions || []).length) return;
+  if(!confirm(`清空全部 ${S.agent.sessions.length} 个历史对话？只删本地记录，不动账本数据。`)) return;
+  if(S.agent.busy) agentStop();
+  S.agent.sessions = [];
+  S.agent.sid = agNewId();
+  S.agent.msgs = [];
+  agentSaveMsgs(); agentPaint(); agentPaintSessions();
+}
+function agentRenameChat(id){
+  const cur = (S.agent.sessions || []).find(s => s.id === id);
+  if(!cur) return;
+  const t = prompt('给这个对话起个名字：', cur.title || '新对话');
+  if(t === null) return;
+  const v = String(t).trim().slice(0, 40);
+  if(!v) return;
+  cur.title = v;
+  try{ localStorage.setItem(AG_SESS_KEY, JSON.stringify(S.agent.sessions)); }catch(e){}
+  agentPaintSessions();
+}
+
+let agRaf = 0;
+/* 流式刷新：每帧最多重绘一次，别让逐字增量把 DOM 打爆 */
+function agSchedulePaint(m){
+  if(agRaf) return;
+  agRaf = requestAnimationFrame(()=>{
+    agRaf = 0;
+    const box = $('#agLive'), sc = $('#agentChat');
+    if(!box || !sc) return;
+    const atBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 90;
+    box.innerHTML = agentLiveHTML(m);
+    if(atBottom) sc.scrollTop = sc.scrollHeight;
+  });
+}
+function agentOnEvent(m, ev){
+  switch(ev.t){
+    case 'start': m.model = ev.model; m.vision = !!ev.vision; break;
+    case 'route':
+      m.route = {mode: ev.mode, label: ev.label, tools: ev.tools || []};
+      m.phase = ''; break;
+    case 'phase': m.phase = ev.name || ''; break;
+    case 'think': m.thinking = (m.thinking || '') + (ev.d || ''); break;
+    case 'text': m.content = (m.content || '') + (ev.d || ''); break;
+    case 'flush_think':
+      if((m.content || '').trim()){
+        m.thinking = (m.thinking || '') + (m.thinking ? '\n\n' : '') + m.content.trim();
+      }
+      m.content = ''; break;
+    case 'tool': {
+      const id = ev.id || ev.name;
+      if(ev.state === 'start'){
+        m.steps.push({id, name: ev.name, label: ev.label, state: 'run'});
+      }else{
+        let s = m.steps.find(x => x.id === id);
+        if(!s){ s = {id, name: ev.name, label: ev.label}; m.steps.push(s); }
+        s.state = 'end'; s.ms = ev.ms; s.summary = ev.summary; s.ok = ev.ok;
+      }
+      break;
+    }
+    case 'links': m.links = ev.links || []; break;
+    case 'proposal':
+      if(ev.proposal){
+        (m.proposals = m.proposals || []).push(
+          Object.assign({status:'pending'}, ev.proposal));
+      }
+      break;
+    case 'usage': m.usage = ev.usage || null; break;
+    case 'done':
+      m.ms = ev.ms; m.turns = ev.turns; m.model = ev.model || m.model; break;
+    case 'error':
+      m.error = true;
+      m.content = (m.content || '') + (m.content ? '\n\n' : '') + '⚠️ ' + ev.msg;
+      break;
+  }
+  agSchedulePaint(m);
+}
+/* ---- 写入草稿：确认 / 取消 / 撤销 ---- */
+function agProp(mi, pi){
+  const m = S.agent.msgs[+mi];
+  return m ? (m.proposals || [])[+pi] : null;
+}
+function agPropEdits(p){
+  if(p.kind !== 'create' && p.kind !== 'import') return {};
+  const out = {};
+  (p.items || []).forEach((it, i)=>{
+    if(!it._dirty) return;
+    out[i] = {date: it.date, amount: agPropMoney(it),
+              direction: agPropDir(it), party: it.party || '',
+              description: it.description || ''};
+  });
+  return out;
+}
+async function agPropConfirm(mi, pi){
+  const p = agProp(mi, pi);
+  if(!p || p.status !== 'pending' || p.busy) return;
+  if(p.danger && !p.ack){ alert('删除操作需要先勾选「我已核对」'); return; }
+  p.busy = true; agentPaint();
   try{
-    const r = await jpost('/api/agent/chat', {message:msg, history});
-    const last = S.agent.msgs[S.agent.msgs.length - 1];
-    if(r.error){
-      last.pending = false; last.error = true; last.content = r.error;
-    }else{
-      last.pending = false; last.content = r.reply || '';
-      last.links = r.links || []; last.steps = r.steps || [];
-      last.pushed = !!r.pushed; last.model = r.model;
+    const r = await jpost(`/api/agent/proposal/${p.pid}/confirm`,
+                          {edits: agPropEdits(p), ack: !!p.ack});
+    p.status = r.done ? 'done' : 'failed';
+    p.result = {done: r.done, failed: r.failed, fails: r.fails, wid: r.wid};
+    p.editing = false;
+    if(r.done){
+      await refreshBootstrap();
+      try{ switchView(S.view); }catch(e){}
     }
   }catch(err){
-    const last = S.agent.msgs[S.agent.msgs.length - 1];
-    last.pending = false; last.error = true; last.content = err.message;
+    alert('写入失败：' + err.message);
   }
-  agentSetBusy(false);
+  p.busy = false;
   agentSaveMsgs(); agentPaint();
+}
+async function agPropCancel(mi, pi){
+  const p = agProp(mi, pi);
+  if(!p || p.status !== 'pending') return;
+  try{ await jpost(`/api/agent/proposal/${p.pid}/cancel`, {}); }catch(e){}
+  p.status = 'cancelled';
+  agentSaveMsgs(); agentPaint();
+}
+async function agPropUndo(mi, pi){
+  const p = agProp(mi, pi);
+  if(!p || !p.result || !p.result.wid) return;
+  if(!confirm('撤销这次写入？数据会回到写入之前。')) return;
+  try{
+    await jpost(`/api/agent/undo/${p.result.wid}`, {});
+    p.status = 'undone';
+    await refreshBootstrap();
+    try{ switchView(S.view); }catch(e){}
+  }catch(err){
+    alert('撤销失败：' + err.message);
+  }
+  agentSaveMsgs(); agentPaint();
+}
+/* 卡片内联编辑：写回模型，不重绘（重绘会打断输入） */
+document.addEventListener('input', e=>{
+  const el = e.target.closest && e.target.closest('.ag-pe');
+  if(!el) return;
+  const p = agProp(el.dataset.mi, el.dataset.pi);
+  const it = p && (p.items || [])[+el.dataset.i];
+  if(!it) return;
+  const k = el.dataset.k;
+  if(k === 'amount'){
+    const amt = Math.abs(parseFloat(String(el.value).replace(/,/g, '')) || 0);
+    if(agPropDir(it) === 'in'){ it.debit = amt; it.credit = 0; }
+    else { it.debit = 0; it.credit = amt; }
+  }else if(k === 'direction'){
+    const amt = agPropMoney(it);
+    if(el.value === 'in'){ it.debit = amt; it.credit = 0; }
+    else { it.debit = 0; it.credit = amt; }
+  }else{
+    it[k] = el.value;
+  }
+  it._dirty = true;
+});
+document.addEventListener('change', e=>{
+  const el = e.target.closest && e.target.closest('.ag-ack');
+  if(!el) return;
+  const p = agProp(el.dataset.mi, el.dataset.pi);
+  if(p) p.ack = el.checked;
+  const card = el.closest('.ag-prop');
+  const btn = card && card.querySelector('[data-action="prop-confirm"]');
+  if(btn) btn.disabled = !el.checked;
+});
+function agentStop(){
+  if(S.agent.abort){
+    try{ S.agent.abort.abort(); }catch(e){}
+  }
+}
+async function agentSend(text){
+  if(S.agent.busy){ agentStop(); return; }
+  const input = $('#agentInput');
+  const msg = (text !== undefined ? text : (input?.value || '')).trim();
+  const atts = (S.agent.atts || []).slice();
+  if(!msg && !atts.length) return;
+  if(input) input.value = '';
+  S.agent.atts = []; agentPaintAtts();
+  const history = S.agent.msgs
+    .filter(m => !m.streaming && !m.error && (m.role === 'user' || (m.role === 'assistant' && m.content)))
+    .slice(-12).map(m => ({role: m.role, content: m.content}));
+  S.agent.msgs.push({role:'user', content: msg || '（见附件）',
+                     atts: atts.length ? atts : undefined, ts: Date.now()});
+  const live = {role:'assistant', content:'', thinking:'', steps:[], route:null,
+                proposals:[], phase:'正在理解问题…', streaming:true, ts: Date.now()};
+  S.agent.msgs.push(live);
+  const curSess = (S.agent.sessions || []).find(s => s.id === S.agent.sid);
+  if(curSess && (!curSess.title || curSess.title === '新对话')){
+    curSess.title = agTitle([{role:'user', content: msg || '附件分析'}]);
+  }
+  agentSaveMsgs(); agentPaint(); agentPaintSessions(); agentSetBusy(true);
+  const ctrl = new AbortController();
+  S.agent.abort = ctrl;
+  const t0 = performance.now();
+  try{
+    const res = await fetch('/api/agent/chat/stream', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        message: msg || '请看我上传的附件，说明关键内容',
+        history, sid: agentSid(),
+        attachments: atts.map(a => a.fid),
+      }),
+      signal: ctrl.signal,
+    });
+    if(!res.ok){
+      let e = {};
+      try{ e = await res.json(); }catch(_){}
+      throw new Error(e.error || ('HTTP ' + res.status));
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while(true){
+      const {value, done} = await reader.read();
+      if(done) break;
+      buf += dec.decode(value, {stream:true});
+      let i;
+      while((i = buf.indexOf('\n\n')) >= 0){
+        const chunk = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        for(const line of chunk.split('\n')){
+          if(line.indexOf('data:') !== 0) continue;
+          const p = line.slice(5).trim();
+          if(!p || p === '[DONE]') continue;
+          try{ agentOnEvent(live, JSON.parse(p)); }catch(err){}
+        }
+      }
+    }
+  }catch(err){
+    if(err.name !== 'AbortError'){
+      live.error = true;
+      live.content = err.message || '请求失败';
+    }else{
+      live.content = (live.content || '') + '\n\n_（已停止生成）_';
+    }
+  }
+  live.streaming = false;
+  live.phase = '';
+  if(!live.ms) live.ms = Math.round(performance.now() - t0);
+  if(!live.error && !live.content && !live.steps.length){
+    live.content = '（没有拿到内容，可以点重新生成或换个模型试试）';
+  }
+  S.agent.abort = null;
+  agentSetBusy(false);
+  agentSaveMsgs(); agentPaint(); agentPaintSessions();
+}
+/* ---- 附件上传 ---- */
+function agFileIcon(a){
+  if(a.kind === 'image') return `<img src="${esc(a.url || '')}" alt="">`;
+  const ico = a.kind === 'sheet' ? '📊' : (a.ext === 'pdf' ? '📕' : '📄');
+  return `<span class="ag-att-ico">${ico}</span>`;
+}
+function agentPaintAtts(){
+  const box = $('#agentAtts');
+  if(!box) return;
+  const list = S.agent.atts || [];
+  if(!list.length){ box.innerHTML = ''; box.style.display = 'none'; return; }
+  box.style.display = 'flex';
+  box.innerHTML = list.map((a, i) => `
+    <span class="ag-att ${a.busy ? 'busy' : ''}" title="${esc(a.name || '')}">
+      ${agFileIcon(a)}
+      <span class="ag-att-n">${esc(a.name || '上传中…')}</span>
+      <span class="ag-att-s">${a.busy ? '…' : (a.size ? Math.round(a.size / 1024) + 'KB' : '')}</span>
+      <button class="ag-att-x" data-action="agent-att-del" data-i="${i}" title="移除">✕</button>
+    </span>`).join('');
+}
+const AG_ACCEPT = '.png,.jpg,.jpeg,.webp,.gif,.bmp,.csv,.tsv,.txt,.md,.json,' +
+                  '.xlsx,.xls,.pdf,.docx';
+async function agentUploadFiles(files){
+  const arr = Array.from(files || []);
+  const room = 6 - (S.agent.atts || []).length;
+  if(room <= 0){ alert('一次最多带 6 个附件'); return; }
+  for(const f of arr.slice(0, room)){
+    if(f.size > 25 * 1024 * 1024){ alert(`${f.name} 超过 25MB，请压缩后再传`); continue; }
+    const isImg = (f.type || '').startsWith('image/');
+    const tmp = {
+      fid: 'tmp' + Date.now() + Math.random().toString(36).slice(2, 6),
+      name: f.name || (isImg ? '截图.png' : '文件'),
+      size: f.size, kind: isImg ? 'image' : 'doc',
+      ext: (f.name || '').split('.').pop().toLowerCase(),
+      url: isImg ? URL.createObjectURL(f) : '', busy: true,
+    };
+    S.agent.atts.push(tmp); agentPaintAtts();
+    try{
+      const fd = new FormData();
+      fd.append('file', f, tmp.name);
+      const r = await fetch('/api/agent/upload', {method:'POST', body: fd});
+      const d = await r.json();
+      if(!d.ok) throw new Error(d.error || '上传失败');
+      const keep = tmp.url;
+      Object.assign(tmp, d.file, {busy: false});
+      if(tmp.kind === 'image') tmp.url = d.file.url || keep;
+    }catch(e){
+      S.agent.atts = S.agent.atts.filter(x => x !== tmp);
+      alert('上传失败：' + e.message);
+    }
+    agentPaintAtts();
+  }
+}
+function agentBindDrop(){
+  const dock = $('#agentDock');
+  if(dock){
+    let depth = 0;
+    const hasFiles = e => !!(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files'));
+    dock.addEventListener('dragenter', e => {
+      if(!hasFiles(e)) return;
+      e.preventDefault(); depth++; dock.classList.add('ag-drop');
+    });
+    dock.addEventListener('dragover', e => { if(hasFiles(e)) e.preventDefault(); });
+    dock.addEventListener('dragleave', () => {
+      depth = Math.max(0, depth - 1);
+      if(!depth) dock.classList.remove('ag-drop');
+    });
+    dock.addEventListener('drop', e => {
+      e.preventDefault(); depth = 0; dock.classList.remove('ag-drop');
+      if(e.dataTransfer && e.dataTransfer.files.length) agentUploadFiles(e.dataTransfer.files);
+    });
+  }
+  const ta = $('#agentInput');
+  if(ta){
+    ta.addEventListener('paste', e => {
+      const items = (e.clipboardData && e.clipboardData.items) || [];
+      const files = [];
+      for(const it of items){
+        if(it.kind === 'file'){
+          const f = it.getAsFile();
+          if(f) files.push(f);
+        }
+      }
+      if(files.length){
+        e.preventDefault();
+        agentUploadFiles(files.map((f, i) => {
+          if((f.type || '').startsWith('image/') && !/\.[a-z]+$/i.test(f.name || '')){
+            try{ return new File([f], `截图-${Date.now()}-${i}.png`, {type: f.type}); }catch(_){ }
+          }
+          return f;
+        }));
+      }
+    });
+  }
+  const inp = $('#agentFile');
+  if(inp) inp.addEventListener('change', () => {
+    if(inp.files && inp.files.length) agentUploadFiles(inp.files);
+    inp.value = '';
+  });
 }
 /* ---- 右侧抽屉 ---- */
 const AGENT_W_KEY = 'journal_agent_width';
@@ -2082,6 +2798,7 @@ function agentOpen(){
   $('#navAgent')?.classList.add('active');
   try{ localStorage.setItem('journal_agent_open', '1'); }catch(e){}
   agentPaint();
+  agentPaintSessions();
   setTimeout(()=>{ if(!agentIsNarrow()) $('#agentInput')?.focus(); }, 240);
 }
 function agentClose(){
@@ -2099,6 +2816,17 @@ function agentToggle(){
 }
 
 async function initAgentDock(){
+  agentBindDrop();
+  agentPaintAtts();
+  agentPaintSessions();
+  try{
+    if(localStorage.getItem(AG_SIDE_KEY) === '1') agentSideToggle(true);
+  }catch(e){}
+  const side = $('#agentSide');
+  if(side) side.addEventListener('dblclick', ev => {
+    const it = ev.target.closest('.ag-side-item');
+    if(it && it.dataset.id) agentRenameChat(it.dataset.id);
+  });
   const q = $('#agentQuick');
   if(q) q.innerHTML = AGENT_QUICK
     .map(t=>`<button class="ag-chip" data-action="agent-chip" data-q="${esc(t)}">${esc(t)}</button>`).join('');
@@ -2124,10 +2852,12 @@ async function initAgentDock(){
   const grip = $('#agentGrip'), dock = $('#agentDock');
   if(grip && dock){
     let dragging = false, startX = 0, startW = 0;
+    const chatW = () => dock.getBoundingClientRect().width
+      - (dock.classList.contains('side-open') ? 210 : 0);
     grip.addEventListener('mousedown', ev=>{
       if(agentIsNarrow()) return;
       dragging = true; startX = ev.clientX;
-      startW = dock.getBoundingClientRect().width;
+      startW = chatW();
       document.body.classList.add('agent-resizing');
       if(dock.setPointerCapture && ev.pointerId != null){
         try{ dock.setPointerCapture(ev.pointerId); }catch(e){}
@@ -2142,7 +2872,7 @@ async function initAgentDock(){
       if(!dragging) return;
       dragging = false;
       document.body.classList.remove('agent-resizing');
-      try{ localStorage.setItem(AGENT_W_KEY, String(Math.round(dock.getBoundingClientRect().width))); }catch(e){}
+      try{ localStorage.setItem(AGENT_W_KEY, String(Math.round(chatW()))); }catch(e){}
     });
   }
 
@@ -2169,6 +2899,20 @@ document.addEventListener('click', async e=>{
       case 'nav': switchView(el.dataset.view); break;
       case 'cash-add': openCashCount(null); break;
       case 'cash-edit': openCashCount(+el.dataset.id); break;
+      case 'cash-copy': {
+        e.stopPropagation();                     // 别同时触发整行的“查看/编辑”
+        await openCashCount(null, +el.dataset.id);
+        break;
+      }
+      case 'cash-export': {
+        const id = el.dataset.id;
+        if(id){
+          location.href = `/api/export/cash-counts?company_id=${S.company}&id=${id}`;
+        }else{
+          openCashExport();
+        }
+        break;
+      }
       case 'cash-del': {
         e.stopPropagation();
         if(!confirm('确定删除这张盘点单？')) break;
@@ -2198,15 +2942,40 @@ document.addEventListener('click', async e=>{
       case 'agent-close': agentClose(); break;
       case 'agent-send': await agentSend(); break;
       case 'agent-chip': await agentSend(el.dataset.q); break;
+      case 'agent-stop': agentStop(); break;
+      case 'agent-pick': { const f = $('#agentFile'); if(f) f.click(); break; }
+      case 'agent-side': agentSideToggle(); break;
+      case 'agent-new': agentNewChat(); break;
+      case 'agent-switch': agentSwitchChat(el.dataset.id); break;
+      case 'agent-del-chat':
+        e.stopPropagation();
+        agentDelChat(el.dataset.id);
+        break;
+      case 'agent-clear-all': agentClearAll(); break;
+      case 'agent-rename': agentRenameChat(el.dataset.id); break;
+      case 'agent-att-del': {
+        const i = +el.dataset.i;
+        S.agent.atts = (S.agent.atts || []).filter((_, k) => k !== i);
+        agentPaintAtts(); break;
+      }
       case 'agent-link': await agentOpenLink(el.dataset.target); break;
       case 'agent-clear': {
         if(!S.agent.msgs.length) break;
         if(!confirm('清空当前对话记录？（不影响账本数据）')) break;
-        S.agent.msgs = []; agentSaveMsgs(); agentPaint(); break;
+        S.agent.msgs = [];
+        S.agent.atts = [];
+        agentSaveMsgs(); agentPaintAtts(); agentPaint(); break;
       }
       case 'agent-settings': agentClose(); switchView('settings'); break;
-      case 'agent-copy': {
-        const m = S.agent.msgs[+el.dataset.idx];
+      case 'prop-confirm': await agPropConfirm(el.dataset.mi, el.dataset.pi); break;
+      case 'prop-cancel': await agPropCancel(el.dataset.mi, el.dataset.pi); break;
+      case 'prop-undo': await agPropUndo(el.dataset.mi, el.dataset.pi); break;
+      case 'prop-edit': {
+        const p = agProp(el.dataset.mi, el.dataset.pi);
+        if(p){ p.editing = !p.editing; agentPaint(); }
+        break;
+      }
+      case 'agent-copy': {        const m = S.agent.msgs[+el.dataset.idx];
         if(!m) break;
         try{ await navigator.clipboard.writeText(m.content); el.textContent = '已复制'; }
         catch(err){
@@ -2249,6 +3018,24 @@ document.addEventListener('click', async e=>{
             msg.style.color = r.ok ? 'var(--green)' : 'var(--red)';
             msg.textContent = r.ok ? `✅ 连接成功（${r.model}）：${r.reply || 'ok'}` : '❌ ' + r.error;
           }
+        }catch(err){
+          if(msg){ msg.style.color = 'var(--red)'; msg.textContent = '❌ ' + err.message; }
+        }
+        break;
+      }
+      case 'agent-vision-test': {
+        const msg = $('#agVisionMsg');
+        if(msg){ msg.style.color = 'var(--muted)'; msg.textContent = '正在发一张测试图…'; }
+        const form = agentCfgForm();
+        try{
+          const r = await jpost('/api/agent/vision-test', form);
+          if(msg){
+            msg.style.color = r.ok ? 'var(--green)' : 'var(--red)';
+            msg.textContent = r.ok
+              ? `✅ 能读图（读到 ${r.reply}），已自动开启`
+              : `❌ 读图失败：${r.error || ('回的是「' + (r.reply || '空') + '」')}`;
+          }
+          if(r.ok && $('#agVision')) $('#agVision').checked = true;
         }catch(err){
           if(msg){ msg.style.color = 'var(--red)'; msg.textContent = '❌ ' + err.message; }
         }

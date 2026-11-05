@@ -38,6 +38,14 @@ app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB
 from agent import bp as agent_bp  # noqa: E402
 app.register_blueprint(agent_bp)
 
+# AI 写入（草稿确认 / 撤销）
+from agent_write import bp as agent_write_bp  # noqa: E402
+app.register_blueprint(agent_write_bp)
+
+# Agent 内核：流式对话（思考过程 + 工具调用 + 正文）、附件上传
+from agent_core import bp as agent_core_bp  # noqa: E402
+app.register_blueprint(agent_core_bp)
+
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS companies(
   id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, sort INTEGER DEFAULT 0);
@@ -939,6 +947,260 @@ def del_cash_count(cid):
         db.execute('DELETE FROM cash_counts WHERE id=?', (cid,))
         db.commit()
     return jsonify({'ok': True})
+
+
+@app.get('/api/export/cash-counts')
+def export_cash_counts():
+    """盘点表导出（Excel）
+    参数：company_id 必填；from / to 可选（按盘点日期过滤）；id 可选（只导这一张）
+    三个工作表：盘点汇总（折 MOP）／盘点明细（原币）／面额明细（每张单一个块）
+    """
+    import io as _io
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.properties import PageSetupProperties
+
+    cid = request.args.get('company_id', type=int)
+    if not cid:
+        return bad('缺少 company_id')
+    frm = (request.args.get('from') or '').strip()
+    to = (request.args.get('to') or '').strip()
+    only_id = request.args.get('id', type=int)
+    for d in (frm, to):
+        if not d:
+            continue
+        try:
+            datetime.strptime(d, '%Y-%m-%d')
+        except ValueError:
+            return bad('日期格式应为 YYYY-MM-DD（且必须是真实日期）')
+
+    db = get_db()
+    cp = db.execute('SELECT * FROM companies WHERE id=?', (cid,)).fetchone()
+    if not cp:
+        return bad('公司不存在', 404)
+    rates = {r['currency']: r['rate'] for r in db.execute('SELECT * FROM rates')}
+    fx = lambda cur: (rates.get(cur) or 1)
+    company = cp['name']
+
+    sql = 'SELECT * FROM cash_counts WHERE company_id=?'
+    args = [cid]
+    if only_id:
+        sql += ' AND id=?'
+        args.append(only_id)
+    if frm:
+        sql += ' AND count_date>=?'
+        args.append(frm)
+    if to:
+        sql += ' AND count_date<=?'
+        args.append(to)
+    sql += ' ORDER BY count_date, id'
+    heads = db.execute(sql, args).fetchall()
+
+    blocks = []                      # [(head, [item+calc+denoms])]
+    for h in heads:
+        items = []
+        for it in db.execute('SELECT * FROM cash_count_items WHERE count_id=? '
+                             'ORDER BY id', (h['id'],)):
+            ds = _denoms_of(db, it['id'])
+            items.append({**rowdict(it), **_cash_item_calc(rowdict(it), ds),
+                          'denoms': ds})
+        if items:
+            blocks.append((rowdict(h), items))
+
+    # ---------- 样式
+    FN = '微软雅黑'
+    thin = Side(style='thin', color='BFBFBF')
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    base = Font(name=FN, size=10)
+    bold = Font(name=FN, size=10, bold=True)
+    right = Alignment(horizontal='right', vertical='center')
+    ctr = Alignment(horizontal='center', vertical='center')
+    wrap = Alignment(horizontal='left', vertical='center', wrap_text=True)
+    money = '#,##0.00'
+
+    def head_row(ws, r, cols, widths=None, fill='4472C4'):
+        for i, t in enumerate(cols, 1):
+            c = ws.cell(r, i, t)
+            c.font = Font(name=FN, size=10, bold=True, color='FFFFFF')
+            c.fill = PatternFill('solid', fgColor=fill)
+            c.alignment = ctr
+            c.border = box
+        ws.row_dimensions[r].height = 26
+        if widths:
+            for i, w in enumerate(widths, 1):
+                ws.column_dimensions[get_column_letter(i)].width = w
+
+    def title_row(ws, r, text, ncols, size=14):
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncols)
+        c = ws.cell(r, 1, text)
+        c.font = Font(name=FN, size=size, bold=True, color='1F4E79')
+        c.alignment = Alignment(horizontal='center', vertical='center')
+        ws.row_dimensions[r].height = 28
+
+    wb = Workbook()
+
+    # ========== Sheet1 盘点汇总（一行一张单，折 MOP） ==========
+    ws = wb.active
+    ws.title = '盘点汇总'
+    ws.sheet_view.showGridLines = False
+    ncol = 10
+    title_row(ws, 1, f'{company}　现金盘点表', ncol)
+    title_row(ws, 2, f'期间：{frm or "不限"} ~ {to or "不限"}　　币种金额已按设置汇率折 MOP', ncol, 9)
+    head_row(ws, 4, ['盘点日期', '币种', '账面应有(折MOP)', '盘点实有(折MOP)',
+                     '差异(折MOP)', '白条抵库(折MOP)', '结果', '盘点人', '监盘人', '备注'],
+             [13, 12, 17, 17, 15, 16, 10, 12, 12, 28])
+    r = 5
+    s_book = s_act = s_diff = s_white = 0.0
+    for h, items in blocks:
+        book = sum(i['book'] * fx(i['currency']) for i in items)
+        act = sum(i['actual'] * fx(i['currency']) for i in items)
+        white = sum(i['white'] * fx(i['currency']) for i in items)
+        diff = act - book
+        s_book += book
+        s_act += act
+        s_diff += diff
+        s_white += white
+        cur_txt = '/'.join(dict.fromkeys(i['currency'] for i in items))
+        vals = [h['count_date'], cur_txt, book, act, diff, white,
+                '盘盈' if diff > 0.005 else ('盘亏' if diff < -0.005 else '相符'),
+                h['person'] or '', h['supervisor'] or '', h['note'] or '']
+        for c, v in enumerate(vals, 1):
+            cell = ws.cell(r, c, v)
+            cell.border = box
+            cell.font = base
+            cell.alignment = wrap if c == 10 else (right if c in (3, 4, 5, 6) else ctr)
+            if c in (3, 4, 5, 6):
+                cell.number_format = money
+            if c == 5 and abs(diff) > 0.005:
+                cell.font = Font(name=FN, size=10, bold=True,
+                                 color='C0392B' if diff < 0 else '19753C')
+        r += 1
+    if not blocks:
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncol)
+        c = ws.cell(r, 1, '该期间没有盘点记录')
+        c.font = base
+        c.alignment = ctr
+        r += 1
+    # 合计
+    ws.cell(r, 1, '合计（折 MOP）').font = bold
+    ws.cell(r, 1).alignment = ctr
+    ws.cell(r, 1).border = box
+    for c in (2, 7, 8, 9, 10):
+        ws.cell(r, c).border = box
+    for c, v in ((3, s_book), (4, s_act), (5, s_diff), (6, s_white)):
+        cell = ws.cell(r, c, round(v, 2))
+        cell.font = bold
+        cell.border = box
+        cell.alignment = right
+        cell.number_format = money
+        cell.fill = PatternFill('solid', fgColor='F2F2F2')
+    for c in (1, 2, 7, 8, 9, 10):
+        ws.cell(r, c).fill = PatternFill('solid', fgColor='F2F2F2')
+    ws.freeze_panes = 'A5'
+
+    # ========== Sheet2 盘点明细（原币逐币种） ==========
+    ws2 = wb.create_sheet('盘点明细')
+    ws2.sheet_view.showGridLines = False
+    cols2 = ['盘点日期', '币种', '上一日账面库存', '未记账收入', '未记账付出',
+             '账面应有', '盘点实有', '差异', '白条抵库', '差异原因', '盘点人', '监盘人']
+    title_row(ws2, 1, f'{company}　盘点明细（原币）', len(cols2))
+    head_row(ws2, 3, cols2, [13, 8, 15, 13, 13, 14, 14, 13, 12, 30, 11, 11])
+    r = 4
+    for h, items in blocks:
+        for it in items:
+            vals = [h['count_date'], it['currency'], it['prev_book'],
+                    it['unposted_in'], it['unposted_out'], it['book'],
+                    it['actual'], it['diff'], it['white'], it['reason'] or '',
+                    h['person'] or '', h['supervisor'] or '']
+            for c, v in enumerate(vals, 1):
+                cell = ws2.cell(r, c, v)
+                cell.border = box
+                cell.font = base
+                cell.alignment = wrap if c == 10 else (right if 3 <= c <= 9 else ctr)
+                if 3 <= c <= 9:
+                    cell.number_format = money
+                if c == 8 and abs(it['diff']) > 0.005:
+                    cell.font = Font(name=FN, size=10, bold=True, color='C0392B')
+            r += 1
+    ws2.freeze_panes = 'A4'
+
+    # ========== Sheet3 面额明细（每张单一个块） ==========
+    ws3 = wb.create_sheet('面额明细')
+    ws3.sheet_view.showGridLines = False
+    ncol3 = len(CASH_DENOMS) + 3
+    title_row(ws3, 1, f'{company}　面额明细（张数 × 面额）', ncol3)
+    ws3.column_dimensions['A'].width = 13
+    ws3.column_dimensions['B'].width = 8
+    for i in range(3, 2 + len(CASH_DENOMS) + 1):
+        ws3.column_dimensions[get_column_letter(i)].width = 8
+    ws3.column_dimensions[get_column_letter(len(CASH_DENOMS) + 4)].width = 14
+    r = 3
+    for h, items in blocks:
+        ws3.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncol3)
+        tc = ws3.cell(r, 1, f'▍{h["count_date"]}　盘点人：{h["person"] or "—"}'
+                            f'　监盘人：{h["supervisor"] or "—"}'
+                            f'　实有合计（折 MOP）：'
+                            f'{sum(i["actual"] * fx(i["currency"]) for i in items):,.2f}')
+        tc.font = Font(name=FN, size=11, bold=True, color='1F4E79')
+        tc.fill = PatternFill('solid', fgColor='DCE6F1')
+        tc.alignment = Alignment(horizontal='left', vertical='center')
+        ws3.row_dimensions[r].height = 22
+        r += 1
+        hd = ['币种'] + [f'{d:g}' for d in CASH_DENOMS] + ['张数合计', '金额合计']
+        for c, v in enumerate(hd, 1):
+            cell = ws3.cell(r, c, v)
+            cell.font = Font(name=FN, size=10, bold=True, color='FFFFFF')
+            cell.fill = PatternFill('solid', fgColor='4472C4')
+            cell.alignment = ctr
+            cell.border = box
+        r += 1
+        for it in items:
+            qmap = {d['denom']: d['qty'] for d in it['denoms']}
+            ws3.cell(r, 1, it['currency']).alignment = ctr
+            ws3.cell(r, 1).border = box
+            ws3.cell(r, 1).font = base
+            tot = 0.0
+            nq = 0
+            for c, dv in enumerate(CASH_DENOMS, 2):
+                q = qmap.get(dv, 0) or 0
+                tot += dv * q
+                nq += q
+                cell = ws3.cell(r, c, q if q else None)
+                cell.alignment = ctr
+                cell.border = box
+                cell.font = base
+                cell.number_format = '0.####'
+            c1 = ws3.cell(r, len(CASH_DENOMS) + 2, nq or None)
+            c1.alignment = ctr
+            c1.border = box
+            c1.font = base
+            c2 = ws3.cell(r, len(CASH_DENOMS) + 3, round(it['actual'], 2))
+            c2.number_format = money
+            c2.alignment = right
+            c2.border = box
+            c2.font = bold
+            r += 1
+        # 无面额明细（只填了金额的老单）也给一行，金额仍有意义
+        r += 1
+
+    for w in wb.worksheets:
+        w.page_setup.orientation = 'landscape'
+        w.page_setup.fitToWidth = 1
+        w.page_setup.fitToHeight = 0
+        w.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+        w.print_options.horizontalCentered = True
+
+    buf = _io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    span = f'{frm or "全部"}~{to or "全部"}' if (frm or to) else '全部'
+    safe = re.sub(r'[\\/:*?"<>|]', '_', company)
+    fname = f'{safe}_现金盘点表_{span}_{date.today():%Y%m%d}.xlsx'
+    return send_file(buf, as_attachment=True, download_name=fname,
+                     mimetype='application/vnd.openxmlformats-officedocument'
+                              '.spreadsheetml.sheet')
+
 
 
 # ---------------------------------------------------------------- dashboard
