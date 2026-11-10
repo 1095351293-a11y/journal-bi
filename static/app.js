@@ -52,24 +52,60 @@ const modalHead = t => `<div class="modal-title">${t}<button class="modal-close"
 const TITLES = {dashboard:'总览看板', journal:'日记账', cash:'现金管理',
                 deposits:'定期存款', tags:'标签管理', orgs:'公司与账户',
                 settings:'设置'};
-function switchView(v){
+const VIEW_KEY = 'jb.view', CO_KEY = 'jb.company', JR_KEY = 'jb.jr';
+/* 刷新后停在原页面：视图 + 公司 + 日记账筛选条件 */
+function viewStateSave(){
+  try{ localStorage.setItem(CO_KEY, String(S.company ?? '')); }catch(e){}
+  try{
+    const j = S.jr;
+    sessionStorage.setItem(JR_KEY, JSON.stringify({
+      accId:j.accId, from:j.from, to:j.to, preset:j.preset,
+      q:j.q, status:j.status, tagId:j.tagId}));
+  }catch(e){}
+}
+function viewStateRestore(){
+  try{
+    const cid = +(localStorage.getItem(CO_KEY) || 0);
+    if(cid && S.companies.some(c=>c.id===cid)) S.company = cid;
+  }catch(e){}
+  try{
+    const j = JSON.parse(sessionStorage.getItem(JR_KEY) || 'null');
+    if(j && typeof j === 'object') Object.assign(S.jr, j, {loaded:false});
+  }catch(e){}
+}
+function switchView(v, opt){
   S.view = v;
   $$('#nav .nav-btn').forEach(b=>b.classList.toggle('active', b.dataset.view===v));
   $('#viewTitle').textContent = TITLES[v]||v;
+  try{ localStorage.setItem(VIEW_KEY, v); }catch(e){}
+  if(!(opt && opt.nohash) && location.hash !== '#'+v){
+    try{ history.replaceState(null, '', '#'+v); }catch(e){ location.hash = v; }
+  }
+  viewStateSave();
   ({dashboard:renderDashboard, journal:renderJournal, cash:renderCash,
     deposits:renderDeposits, tags:renderTags, orgs:renderOrgs,
     settings:renderSettings})[v]();
+}
+/* 账本被改过：把带缓存的数据丢掉再重画当前页 */
+function invalidateCaches(){ S.jr.loaded = false; }
+async function refreshAfterWrite(){
+  await refreshBootstrap();
+  invalidateCaches();
+  try{ await switchView(S.view, {nohash:true}); }catch(e){}
 }
 
 /* ============ 启动 ============ */
 async function boot(){
   await refreshBootstrap();
   bindStatic();
+  viewStateRestore();
   S.agent.msgs = agentLoadMsgs();
   await initAgentDock();
-  // 支持 #cash / #journal 这类锚点直接打开对应页面
-  const init = (location.hash || '').replace('#', '');
-  switchView(TITLES[init] ? init : 'dashboard');
+  // #journal / #cash 这类锚点可直接打开对应页面；否则回到上次停留的页面
+  const hash = (location.hash || '').replace('#', '');
+  const last = (()=>{ try{ return localStorage.getItem(VIEW_KEY) || ''; }catch(e){ return ''; } })();
+  const init = TITLES[hash] ? hash : (TITLES[last] ? last : 'dashboard');
+  switchView(init);
   await loadReminders();
   if(activeReminders().length && overlay.classList.contains('hidden')) openReminderModal();
 }
@@ -1846,7 +1882,8 @@ function agSlimMsgs(msgs){
       pid: p.pid, kind: p.kind, title: p.title, status: p.status,
       danger: p.danger, warnings: (p.warnings || []).slice(0, 6),
       items: (p.items || []).slice(0, 200), result: p.result,
-      ack: p.ack, at: p.at,
+      ack: p.ack, at: p.at, replaced: p.replaced || false,
+      superseded: p.superseded || [],
     })),
     route: m.route, turns: m.turns, ms: m.ms, atts: m.atts,
     model: m.model, ts: m.ts,
@@ -2218,8 +2255,42 @@ function agPropMoney(it){
 function agPropItemsHTML(p, mi, pi){
   const items = p.items || [];
   const ed = !!p.editing;
+  const cell = (k, it, i, cls, type) => {
+    const v = k === 'amount' ? agPropMoney(it).toFixed(2) : (it[k] ?? '');
+    return `<input class="ag-pe ${cls||''}" type="${type||'text'}"
+      data-mi="${mi}" data-pi="${pi}" data-i="${i}" data-k="${k}"
+      value="${esc(String(v))}">`;
+  };
   if(p.kind === 'update'){
     const it = items[0] || {};
+    // 老卡片没有整行字段：从 changes 里补一份，保证「改字段」能编辑
+    if(it.description === undefined){
+      const to = k => ((it.changes || []).find(c => c.field === k) || {}).to;
+      it.description = to('description') ?? it.summary ?? '';
+      it.party = to('party') ?? '';
+      if(!it.date) it.date = to('date') ?? '';
+      const amt = it.amount || 0;
+      it.debit = it.direction === 'in' ? amt : 0;
+      it.credit = it.direction === 'in' ? 0 : amt;
+    }
+    const dir = agPropDir(it);
+    if(ed){
+      return `<div class="ag-prop-tbl"><table><thead><tr>
+          <th>日期</th><th>收支</th><th class="num">金额</th><th>摘要 / 对方</th>
+        </tr></thead><tbody><tr>
+          <td>${cell('date', it, 0, 'dt')}</td>
+          <td><select class="ag-pe sel" data-mi="${mi}" data-pi="${pi}" data-i="0" data-k="direction">
+            <option value="out"${dir==='out'?' selected':''}>支</option>
+            <option value="in"${dir==='in'?' selected':''}>收</option></select></td>
+          <td>${cell('amount', it, 0, 'num', 'number')}</td>
+          <td class="ag-prop-desc">
+            ${cell('description', it, 0, '', 'text')}
+            ${cell('party', it, 0, 'sm2', 'text')}
+          </td>
+        </tr></tbody></table></div>
+        <div class="ag-chg-meta">${esc(it.account_name||'')} · ${esc(it.currency||'')} · #${it.entry_id}
+          · 改完直接点「确认写入」</div>`;
+    }
     return `<div class="ag-prop-chg">${(it.changes || []).map(c => `
       <div class="ag-chg">
         <span class="ag-chg-l">${esc(c.label)}</span>
@@ -2266,8 +2337,9 @@ function agPropItemsHTML(p, mi, pi){
 }
 function agProposalHTML(p, mi, pi){
   const st = p.status || 'pending';
-  const stTxt = {pending:'待确认', done:'已写入', undone:'已撤销',
-                 cancelled:'已取消', failed:'未写入'}[st] || st;
+  const stTxt = (p.replaced && st === 'cancelled') ? '已作废'
+    : ({pending:'待确认', done:'已写入', undone:'已撤销',
+        cancelled:'已取消', failed:'未写入'}[st] || st);
   const head = `<div class="ag-prop-h">
       <span class="ag-prop-ico">${st === 'pending' ? (p.danger ? '⚠️' : '📝') : (st === 'done' ? '✓' : '·')}</span>
       <span class="ag-prop-t">${esc(p.title || AG_PROP_KIND[p.kind] || '写入草稿')}</span>
@@ -2279,7 +2351,7 @@ function agProposalHTML(p, mi, pi){
       ? `已写入 ${r.done || 0} 笔${r.failed ? `，${r.failed} 笔失败` : ''}`
       : st === 'undone' ? '已撤销，数据回到这次写入之前'
       : st === 'failed' ? '没有写入任何记录'
-      : '已取消，账本没有变化';
+      : (p.replaced ? '已被新的草稿替代，以下面那张卡片为准' : '已取消，账本没有变化');
     return `<div class="ag-prop ${st} ${p.danger?'danger':''}">${head}
       <div class="ag-prop-res">${esc(line)}
         ${(r.fails||[]).length ? `<div class="muted small">${esc((r.fails||[]).slice(0,3).join('；'))}</div>`:''}
@@ -2304,7 +2376,7 @@ function agProposalHTML(p, mi, pi){
     <div class="ag-prop-f">
       <button class="btn sm primary" data-action="prop-confirm" data-mi="${mi}" data-pi="${pi}"
         ${p.danger && !p.ack ? 'disabled' : ''}>${okTxt}</button>
-      ${p.kind === 'create' || p.kind === 'import'
+      ${p.kind === 'create' || p.kind === 'import' || p.kind === 'update'
         ? `<button class="btn sm" data-action="prop-edit" data-mi="${mi}" data-pi="${pi}">${p.editing?'完成修改':'改字段'}</button>` : ''}
       <button class="btn sm" data-action="prop-cancel" data-mi="${mi}" data-pi="${pi}">取消</button>
       <span class="muted small">确认前不会改动账本</span>
@@ -2495,6 +2567,15 @@ function agentOnEvent(m, ev){
     case 'links': m.links = ev.links || []; break;
     case 'proposal':
       if(ev.proposal){
+        // 新草稿替代了旧的（同一笔再改一次）：把旧卡片标成已作废，免得点错
+        const sup = ev.proposal.superseded || [];
+        if(sup.length){
+          (S.agent.msgs || []).forEach(mm => (mm.proposals || []).forEach(q => {
+            if(sup.indexOf(q.pid) >= 0 && q.status === 'pending'){
+              q.status = 'cancelled'; q.replaced = true;
+            }
+          }));
+        }
         (m.proposals = m.proposals || []).push(
           Object.assign({status:'pending'}, ev.proposal));
       }
@@ -2515,6 +2596,13 @@ function agProp(mi, pi){
   return m ? (m.proposals || [])[+pi] : null;
 }
 function agPropEdits(p){
+  if(p.kind === 'update'){
+    const it = (p.items || [])[0];
+    if(!it || !it._dirty) return {};
+    return {0: {date: it.date, amount: agPropMoney(it),
+                direction: agPropDir(it), description: it.description || '',
+                party: it.party || ''}};
+  }
   if(p.kind !== 'create' && p.kind !== 'import') return {};
   const out = {};
   (p.items || []).forEach((it, i)=>{
@@ -2537,8 +2625,7 @@ async function agPropConfirm(mi, pi){
     p.result = {done: r.done, failed: r.failed, fails: r.fails, wid: r.wid};
     p.editing = false;
     if(r.done){
-      await refreshBootstrap();
-      try{ switchView(S.view); }catch(e){}
+      await refreshAfterWrite();
     }
   }catch(err){
     alert('写入失败：' + err.message);
@@ -2560,8 +2647,7 @@ async function agPropUndo(mi, pi){
   try{
     await jpost(`/api/agent/undo/${p.result.wid}`, {});
     p.status = 'undone';
-    await refreshBootstrap();
-    try{ switchView(S.view); }catch(e){}
+    await refreshAfterWrite();
   }catch(err){
     alert('撤销失败：' + err.message);
   }

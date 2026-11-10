@@ -168,9 +168,45 @@ def add_proposal(sid, kind, title, items, warnings=None, danger=False):
          'status': 'pending', 'ts': time.time(),
          'at': datetime.now().strftime('%H:%M')}
     with _lock:
+        # 同一笔流水再次起草修改：旧草稿自动作废，界面上只留最新那张卡片
+        superseded = []
+        if kind == 'update' and items:
+            eid = items[0].get('entry_id')
+            for old in PROPOSALS.values():
+                if (old.get('sid') == p['sid'] and old.get('status') == 'pending'
+                        and old.get('kind') == 'update' and old.get('items')
+                        and old['items'][0].get('entry_id') == eid):
+                    old['status'] = 'cancelled'
+                    old['replaced_by'] = pid
+                    superseded.append(old['pid'])
+        if superseded:
+            p['_superseded'] = superseded
+            p['_sup_ts'] = time.time()
         PROPOSALS[pid] = p
         _save()
     return p
+
+
+def has_pending(sid):
+    """这个会话里还有没有未处理的草稿（决定追问时要不要继续挂写工具）。"""
+    _load()
+    now = time.time()
+    with _lock:
+        return any(p.get('sid') == sid and p.get('status') == 'pending'
+                   and now - p.get('ts', 0) < PROP_TTL
+                   for p in PROPOSALS.values())
+
+
+def pending_list(sid, limit=3):
+    """列出会话里还没处理的草稿，供系统提示词描述「界面上的卡片」。"""
+    _load()
+    now = time.time()
+    with _lock:
+        ps = [p for p in PROPOSALS.values()
+              if p.get('sid') == sid and p.get('status') == 'pending'
+              and now - p.get('ts', 0) < PROP_TTL]
+    ps.sort(key=lambda p: p.get('ts') or 0, reverse=True)
+    return ps[:limit]
 
 
 def get_proposal(pid):
@@ -342,7 +378,8 @@ def _ui(p):
     """给前端的最小结构：不含 status/ts 等内部字段。"""
     return {'pid': p['pid'], 'kind': p['kind'], 'title': p['title'],
             'items': p['items'], 'warnings': p['warnings'][:12],
-            'danger': p['danger'], 'at': p['at']}
+            'danger': p['danger'], 'at': p['at'],
+            'superseded': p.get('_superseded') or []}
 
 
 # ---------------------------------------------------------------- 工具：新增
@@ -366,16 +403,63 @@ UPD_FIELDS = ('date', 'description', 'party', 'project', 'note',
               'check_no', 'amount', 'direction', 'pending')
 
 
+def _entry_row(eid):
+    return next(iter(_fetch('SELECT e.*, a.name AS account_name, a.currency '
+                            'FROM entries e JOIN accounts a ON a.id=e.account_id '
+                            'WHERE e.id=?', (eid,))), None)
+
+
+def _locate_entry(args):
+    """定位要改的那一笔：优先 entry_id，其次用关键词/日期/对方反查。
+
+    返回 (row, err)。反查命中多笔时把候选写进 err，让模型自己挑一个 id 再来。
+    """
+    eid = _opt_int(args.get('entry_id') or args.get('id') or args.get('entryId'))
+    if eid:
+        row = _entry_row(eid)
+        if row:
+            return row, None
+        return None, (f'流水 id={eid} 不存在（可能已被删除）。'
+                      f'先用 query_entries 重新确认 id')
+    kw = str(args.get('keyword') or args.get('match') or '').strip()
+    dt = _parse_date(args.get('match_date')) if args.get('match_date') else ''
+    party = str(args.get('match_party') or '').strip()
+    cond, p = [], []
+    if kw:
+        cond.append('(e.description LIKE ? OR e.party LIKE ? OR e.note LIKE ? '
+                    'OR e.project LIKE ? OR e.check_no LIKE ? OR e.description LIKE ?)')
+        p += [f'%{kw}%'] * 5 + [f'%{kw.replace(" ", "")}%']
+    if dt:
+        cond.append('e.date=?')
+        p.append(dt)
+    if party:
+        cond.append('e.party LIKE ?')
+        p.append(f'%{party}%')
+    if not cond:
+        return None, '缺少 entry_id。先 query_entries 找到要改的那一笔，再传它的 entry_id'
+    try:
+        rr = _fetch('SELECT e.id, e.date, e.description, e.party, e.debit, e.credit, '
+                    'a.name AS account_name FROM entries e '
+                    'JOIN accounts a ON a.id=e.account_id WHERE ' +
+                    ' AND '.join(cond) + ' ORDER BY e.date DESC, e.id DESC LIMIT 6', p)
+    except Exception as exc:
+        return None, f'定位失败：{exc}'
+    if not rr:
+        return None, '按这些条件没找到流水，换个关键词或给日期再试'
+    if len(rr) == 1:
+        return _entry_row(rr[0]['id']), None
+    cand = '；'.join(f"#{r['id']} {r['date']} {(r['description'] or '')[:24]} "
+                     f"{r['debit'] or r['credit']:,.2f}" for r in rr)
+    return None, f'命中 {len(rr)} 笔，请挑一笔把 entry_id 传进来：{cand}'
+
+
 def w_propose_update(args):
     sid = str(args.get('__sid') or '')
-    eid = _opt_int(args.get('entry_id'))
-    if not eid:
-        return {'error': '缺少 entry_id。先用 query_entries 找到要改的那一笔'}, []
-    row = next(iter(_fetch('SELECT e.*, a.name AS account_name, a.currency '
-                           'FROM entries e JOIN accounts a ON a.id=e.account_id '
-                           'WHERE e.id=?', (eid,))), None)
-    if not row:
-        return {'error': f'流水 id={eid} 不存在'}, []
+    row, err = _locate_entry(args)
+    if err:
+        return {'error': err}, []
+    eid = row['id']
+
 
     after, changes, warns = {}, [], []
     for k in ('description', 'party', 'project', 'note', 'check_no'):
@@ -429,11 +513,18 @@ def w_propose_update(args):
         return {'error': '没看出要改什么。请给出至少一个要变更的字段'}, []
 
     item = {'entry_id': eid, 'date': row['date'],
+            'account_id': row['account_id'],
             'account_name': row['account_name'], 'currency': row['currency'],
             'summary': (row['description'] or '')[:40],
             'amount': row['debit'] or row['credit'],
+            'debit': row['debit'], 'credit': row['credit'],
             'direction': 'in' if row['debit'] else 'out',
-            'changes': changes, 'after': after, 'before': dict(row)}
+            # 卡片里可直接改的当前值
+            'description': row['description'] or '', 'party': row['party'] or '',
+            'project': row['project'] or '', 'note': row['note'] or '',
+            'check_no': row['check_no'] or '',
+            'pending': int(row['pending'] or 0),
+            'changes': changes, 'after': after}
     p = add_proposal(sid, 'update', f'修改流水 #{eid}', [item], warns)
     res = {'ok': True, 'pid': p['pid'], 'count': 1,
            'draft': f"#{eid} " + '；'.join(
@@ -874,6 +965,16 @@ def apply_proposal(pid, edits=None, ack=False):
                     nd = _parse_date(v)
                     if nd:
                         after['date'] = nd
+            # 卡片上直接改金额/方向/状态（编辑后提交）
+            new_amt = None
+            if ed.get('amount') not in (None, ''):
+                try:
+                    new_amt = abs(float(str(ed.get('amount')).replace(',', '')))
+                except (TypeError, ValueError):
+                    new_amt = None
+            new_dir = str(ed.get('direction') or '').strip().lower()
+            if ed.get('pending') is not None:
+                after['pending'] = 1 if ed.get('pending') else 0
             row = db.execute('SELECT * FROM entries WHERE id=?',
                              (it['entry_id'],)).fetchone()
             if not row:
@@ -883,6 +984,15 @@ def apply_proposal(pid, edits=None, ack=False):
                            if k in ('date', 'debit', 'credit', 'description',
                                     'party', 'project', 'note', 'check_no',
                                     'pending')})
+            if new_amt is not None or new_dir in ('in', 'out'):
+                amt = new_amt if new_amt is not None else (
+                    merged['debit'] or merged['credit'])
+                way = new_dir if new_dir in ('in', 'out') else (
+                    'in' if row['debit'] else 'out')
+                merged['debit'], merged['credit'] = (
+                    (round(amt, 2), 0.0) if way == 'in'
+                    else (0.0, round(amt, 2)))
+            merged['pending'] = 1 if int(merged.get('pending') or 0) else 0
             err, f = A.validate_entry_payload(_entry_payload({
                 'account_id': row['account_id'], 'date': merged['date'],
                 'check_no': merged['check_no'], 'description': merged['description'],
@@ -1081,10 +1191,17 @@ DEFS = [
     {'type': 'function', 'function': {
         'name': 'propose_update_entry',
         'description': '修改一笔已有流水的草稿（不会立刻写库）。只传要改的字段。'
-                       '改金额时同时给 amount 与 direction。先用 query_entries 找到 entry_id。',
+                       '定位方式二选一：① entry_id（先用 query_entries 查到，最稳）；'
+                       '② keyword（摘要/对方关键词）+ match_date（原日期），命中唯一一笔才生效。'
+                       '改金额时同时给 amount 与 direction。',
         'parameters': {'type': 'object', 'properties': {
-            'entry_id': {'type': 'integer', 'description': '要改的流水 id'},
-            'date': {'type': 'string'},
+            'entry_id': {'type': 'integer', 'description': '要改的流水 id（优先用）'},
+            'keyword': {'type': 'string',
+                        'description': '没有 id 时用：摘要/对方里的关键词，命中唯一一笔才生效'},
+            'match_date': {'type': 'string',
+                           'description': '配合 keyword 用，限定原流水的日期'},
+            'match_party': {'type': 'string', 'description': '配合 keyword 用，限定对方'},
+            'date': {'type': 'string', 'description': '改成哪一天（不是用来定位）'},
             'description': {'type': 'string'},
             'party': {'type': 'string'},
             'project': {'type': 'string'},
@@ -1095,7 +1212,7 @@ DEFS = [
             'pending': {'type': 'boolean'},
             'tags': {'type': 'array', 'items': {'type': 'string'},
                      'description': '完整替换标签；传空数组表示清空'},
-        }, 'required': ['entry_id']}}},
+        }, 'required': []}}},
     {'type': 'function', 'function': {
         'name': 'propose_delete_entries',
         'description': '删除流水的草稿（高危，用户必须在卡片上勾选确认才会执行）。'

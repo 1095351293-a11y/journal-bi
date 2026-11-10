@@ -59,8 +59,12 @@ _RE_WRITE = re.compile(
     r'改成|改为|修改|调整成|更新一下这|把.{0,12}(摘要|备注|对方|项目|金额|日期|标签)'
     r'.{0,6}(改|换|调)|打标签|加标签|标记为|标一下|'
     r'删掉|删除|去掉这|移除这|作废这|重复了|'
-    r'导入|批量加|批量录|把.{0,10}(对账单|账单|表).{0,6}(导入|录|记))')
+    r'导入|批量加|批量录|把.{0,10}(对账单|账单|表).{0,6}(导入|录|记)|'
+    # 对着上一张草稿提意见、要求重来：这些说法同样要挂写工具
+    r'重新(改|写|来|做|生成|起)|再改|改一下|改改|换个(说法|金额|日期|账户|摘要)|'
+    r'换一个|不对|不满意|不准确|写错|填错|弄错|刚才那(个|笔)|重新起草)')
 _RE_NO_WRITE = re.compile(r'(导出|下载|打印|怎么记|如何记|能不能记|可以记)')
+_RE_CANCEL = re.compile(r'(算了|不用了|先不用|取消|不要了|不改了|别改|撤销掉?)')
 # 出现这些词，说明问题本身定义了新的数据范围，不能只靠已有事实回答
 _RE_SCOPE = re.compile(
     r'(\d{4}\s*[-/年]\s*\d{1,2}|\d{1,2}\s*月|本月|这个月|上个?月|今年|去年|'
@@ -78,10 +82,14 @@ _TOOLSET_RULES = [
 ]
 
 
-def route_intent(text, has_facts=False, has_atts=False):
+def route_intent(text, has_facts=False, has_atts=False, has_pending=False):
     """决定这次要不要查库、给模型看哪些工具。
 
     返回 {'mode': 'direct'|'context'|'agent', 'reply': 直答文案, 'tools': 工具名列表或 None}
+
+    has_pending：这个会话里还有没处理完的草稿。有草稿时，用户对草稿提意见
+    （「不行，重新改一下」这种没带具体字段的短句）也必须挂上写工具，否则模型
+    只能嘴上说「改好了」，界面不会再出卡片。
     """
     t = (text or '').strip()
     if not t:
@@ -91,6 +99,10 @@ def route_intent(text, has_facts=False, has_atts=False):
         return {'mode': 'agent', 'tools': None, 'write': True}
     if _RE_WRITE.search(t) and not _RE_NO_WRITE.search(t):
         # 写入意图：先让它查清账户/流水，再起草，工具全开
+        return {'mode': 'agent', 'tools': None, 'write': True}
+    if (has_pending and not _RE_CANCEL.search(t) and not _RE_CAP.search(t)
+            and not _RE_GREET.match(t)):
+        # 还有草稿没处理：用户大概率是在提修改意见，写工具继续挂着
         return {'mode': 'agent', 'tools': None, 'write': True}
     if _RE_GREET.match(t):
         return {'mode': 'direct', 'tools': [],
@@ -308,12 +320,44 @@ def facts_block(sid):
     return '\n'.join(lines)
 
 
+def pending_block(sid):
+    """把界面上待确认的草稿写进系统提示，模型才知道用户在对哪张卡片提意见。"""
+    try:
+        from agent_write import pending_list
+        ps = pending_list(sid)
+    except Exception:
+        return ''
+    if not ps:
+        return ''
+    lines = []
+    for p in ps:
+        items = p.get('items') or []
+        it = items[0] if items else {}
+        if p.get('kind') == 'update':
+            chg = '；'.join(f"{c.get('label')} {c.get('from') or '空'}→{c.get('to')}"
+                            for c in (it.get('changes') or [])[:4])
+            lines.append(f"- 待确认修改 流水#{it.get('entry_id')}（{it.get('date')} "
+                         f"{it.get('account_name')}）：{chg}")
+        elif p.get('kind') == 'create':
+            lines.append(f"- 待确认新增：{it.get('date')} {it.get('description') or ''} "
+                         f"{it.get('debit') or it.get('credit') or 0:,.2f} "
+                         f"{it.get('currency') or ''}")
+        elif p.get('kind') == 'delete':
+            lines.append(f"- 待确认删除：{len(items)} 笔")
+        else:
+            lines.append(f"- 待确认批量导入：{len(items)} 行")
+    return ('\n\n## 当前界面上还没确认的草稿\n' + '\n'.join(lines) +
+            '\n用户对这些草稿不满意时会用「不对」「重新改」「换个说法」这类短句提意见。'
+            '这种时候必须重新调用对应的 propose_* 工具生成新草稿（旧草稿会自动作废），'
+            '不能只回复「已修改」。')
+
+
 def build_system(sid, company, att_block=''):
     try:
         tmpl = load_system_template()
     except Exception:
         tmpl = ''
-    extra = (att_block or '') + facts_block(sid)
+    extra = (att_block or '') + facts_block(sid) + pending_block(sid)
     out = tmpl.replace('{today}', date.today().isoformat())
     out = out.replace('{company}', company or '（未设置）')
     out = out.replace('{extra}', extra)
@@ -466,7 +510,12 @@ def run_agent_stream(cfg, sid, history, text, atts=None):
     atts = atts or []
     try:
         d = sess_get(sid)
-        route = route_intent(text, bool(d['facts']), bool(atts))
+        try:
+            from agent_write import has_pending as _has_pending
+            pending = _has_pending(sid)
+        except Exception:
+            pending = False
+        route = route_intent(text, bool(d['facts']), bool(atts), pending)
         yield {'t': 'route', 'mode': route['mode'],
                'label': ('看图并核对账目' if atts else
                          {'direct': '直接回答', 'context': '基于已有结果',
@@ -496,6 +545,7 @@ def run_agent_stream(cfg, sid, history, text, atts=None):
         tools = pick_tools(route.get('tools'), route.get('write', False))
         usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
         auto_links, pushed_links = [], []
+        emitted_proposal = False
         rounds = max(1, min(int(cfg.get('max_rounds') or 6), 12))
         reply = ''
         turns = 0
@@ -572,6 +622,7 @@ def run_agent_stream(cfg, sid, history, text, atts=None):
                        'label': TOOL_LABEL.get(name, name), 'ms': ms,
                        'ok': ok, 'summary': summary[:300]}
                 if ui and ui.get('proposal'):
+                    emitted_proposal = True
                     yield {'t': 'proposal', **ui}
                 bucket = pushed_links if name == 'show_links' else auto_links
                 for l in links:
@@ -602,6 +653,13 @@ def run_agent_stream(cfg, sid, history, text, atts=None):
         shown = [] if inline else (pushed_links or auto_links)
         if shown:
             yield {'t': 'links', 'links': shown[:LINK_TOTAL]}
+        # 兜底：嘴上说「已生成草稿」但这次根本没调写入工具 —— 如实告诉用户
+        claims = re.search(r'(已生成|已经生成|生成了|已起草|已改|已经改|改好了|'
+                           r'已调整|已更新|已写入|已经写入)', reply or '')
+        asking = ('？' in (reply or '')) or ('?' in (reply or ''))
+        if (not emitted_proposal and route.get('write') and claims and not asking):
+            yield {'t': 'text', 'd': '\n\n⚠️ 这次没有真的生成草稿（我只回了话，没调工具）。'
+                                     '再说一句「重新改一下」，我立刻重新起草。'}
         yield {'t': 'done', 'model': cfg.get('model'),
                'ms': int((time.time() - t0) * 1000), 'turns': turns,
                'usage': usage}
