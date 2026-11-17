@@ -515,7 +515,8 @@ def note_reminders():
     """全部带备注或标签（待跟进）的流水，供侧栏提醒弹窗使用"""
     db = get_db()
     rows = db.execute(
-        "SELECT e.id, e.account_id, e.date, e.description, e.note, "
+        "SELECT e.id, e.account_id, e.date, e.description, e.note, e.party, "
+        "e.project, e.debit, e.credit, e.check_no, e.pending, "
         "a.name AS account_name, a.currency, c.id AS company_id, "
         "c.name AS company_name "
         "FROM entries e JOIN accounts a ON a.id = e.account_id "

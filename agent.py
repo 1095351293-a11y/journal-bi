@@ -711,7 +711,7 @@ TOOL_LABEL = {
     'compare_periods': '两期对比', 'show_links': '推送链接',
 }
 
-# 写入工具（只生成草稿，落库要用户点确认）——单独一层，查询时可整体关掉
+# 写入工具（流水新增/修改/删除/导入/撤销）——单独一层，可按策略决定直写还是确认
 try:
     from agent_write import WRITE_IMPL, WRITE_LABELS, WRITE_TOOLS
     TOOLS.extend(WRITE_TOOLS)
@@ -720,8 +720,21 @@ try:
 except Exception as _e:      # 写入层坏了不影响查账
     print('[agent] 写入工具未加载:', _e)
 
+# 管理工具（公司/账户/标签/定期/汇率/盘点/备份）——系统维护面
+try:
+    from agent_admin import (IMPL as ADMIN_IMPL, LABELS as ADMIN_LABELS,
+                             TOOLS as ADMIN_TOOLS)
+    TOOLS.extend(ADMIN_TOOLS)
+    TOOL_IMPL.update(ADMIN_IMPL)
+    TOOL_LABEL.update(ADMIN_LABELS)
+except Exception as _e:
+    print('[agent] 管理工具未加载:', _e)
+
 WRITE_NAMES = {'propose_entry', 'propose_update_entry',
-               'propose_delete_entries', 'import_file', 'propose_import'}
+               'propose_delete_entries', 'import_file', 'propose_import',
+               'undo_write', 'manage_company', 'manage_account', 'manage_tag',
+               'manage_deposit', 'set_exchange_rates', 'manage_cash_count',
+               'backup_now'}
 
 SYSTEM_PROMPT = """你是「日记账 BI 系统」内置的查账助手，服务对象是企业的财务人员。
 

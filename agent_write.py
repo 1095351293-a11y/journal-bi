@@ -127,6 +127,47 @@ def _today():
     return datetime.now().strftime('%Y-%m-%d')
 
 
+# ---------------------------------------------------------------- 直写（分级权限）
+def _auto_apply(p, res):
+    """策略是 auto 就不等确认，立刻落库，把执行结果并回工具返回。
+
+    confirm 策略原样返回（前端会渲染草稿卡）。
+    落库失败时把草稿留在队列里，别让用户以为写进去了。
+    """
+    try:
+        from agent_perm import is_auto
+        if not is_auto(p.get('kind')):
+            return res
+    except Exception:
+        return res
+    try:
+        payload, _status = apply_proposal(p['pid'], ack=True)
+    except Exception as exc:                      # 不该发生，兜底别把对话打断
+        res['auto'] = False
+        res['auto_error'] = f'{type(exc).__name__}: {exc}'
+        return res
+    if not payload.get('ok'):
+        res['auto'] = False
+        res['auto_error'] = (payload.get('error')
+                             or '；'.join(payload.get('fails') or [])
+                             or '写入失败')
+        # 失败的草稿标回 pending，让用户还能在卡片上看到并手工处理
+        p['status'] = 'pending'
+        with _lock:
+            _save()
+        res['__ui'] = {'proposal': _ui(p)}
+        res['note'] = '自动写入失败，草稿已留在界面上，请用户核对后手工确认。'
+        return res
+    res.pop('__ui', None)
+    res['auto'] = True
+    res['written'] = payload.get('items') or []
+    res['wid'] = payload.get('wid')
+    res['note'] = ('已直接写入账本（用户授予了直写权限，不需要点确认）。'
+                   '回复时说明写入了哪几笔，并把 wid 一并告诉用户，'
+                   '他可随时说「撤销这次」来还原。')
+    return res
+
+
 # ---------------------------------------------------------------- 草稿队列
 def _load():
     global _loaded
@@ -329,7 +370,7 @@ def _build_item(args, idx=0, default_year=None, force_account=None):
             debit, credit = 0.0, amount
         else:
             credit = amount
-            warns.append('没说明收支方向，按「支出」处理——如果其实是收入，请在卡片里改')
+            warns.append('没说明收支方向，按「支出」处理——如果其实是收入，说一声我改')
     if debit and credit:
         return None, warns, f'第 {idx + 1} 行收入与支出只能填一项'
     if not (debit or credit):
@@ -395,7 +436,7 @@ def w_propose_entry(args):
            'note': '草稿已推给用户，等他点「确认写入」才落库。'
                    '回复里用一句话说明你要记什么、有没有疑点即可，不要复述整张表。'}
     res['__ui'] = {'proposal': _ui(p)}
-    return res, []
+    return _auto_apply(p, res), []
 
 
 # ---------------------------------------------------------------- 工具：修改
@@ -502,7 +543,7 @@ def w_propose_update(args):
                             'from': f"{row['currency']} {old_amt:,.2f}",
                             'to': f"{row['currency']} {amt:,.2f}"})
             after['debit'], after['credit'] = nd_debit, nd_credit
-            warns.append(f'金额会被改写：{old_amt:,.2f} → {amt:,.2f}，请核对后在卡片确认')
+            warns.append(f'金额会被改写：{old_amt:,.2f} → {amt:,.2f}，请核对')
     if args.get('tags') is not None:
         ids, names = resolve_tags(args.get('tags'))
         changes.append({'field': 'tags', 'label': '标签',
@@ -532,7 +573,7 @@ def w_propose_update(args):
            'warnings': warns,
            'note': '草稿已推给用户确认。不要自行断定已改好。'}
     res['__ui'] = {'proposal': _ui(p)}
-    return res, []
+    return _auto_apply(p, res), []
 
 
 # ---------------------------------------------------------------- 工具：删除
@@ -1167,12 +1208,51 @@ def api_undo(wid):
 
 
 # ---------------------------------------------------------------- 工具声明
+# ---------------------------------------------------------------- 工具：撤销
+def last_wid(sid=''):
+    """最近一次还没撤销的写入 id。"""
+    best = None
+    try:
+        with open(WRITE_LOG, encoding='utf-8') as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get('undone'):
+                    continue
+                if sid and r.get('sid') and r.get('sid') != sid:
+                    continue
+                best = r
+    except OSError:
+        pass
+    return (best or {}).get('wid')
+
+
+def w_undo(args):
+    sid = str(args.get('__sid') or '')
+    wid = str(args.get('wid') or '').strip()
+    if not wid or wid.lower() in ('last', '最近', '上一次'):
+        wid = last_wid(sid)
+        if not wid:
+            return {'error': '没找到可撤销的写入记录（日志是空的，或都撤过了）'}, []
+    payload, status = undo_write(wid)
+    if payload.get('error'):
+        return payload, []
+    return {'ok': True, 'wid': wid, 'undone': payload.get('undone'),
+            'message': f"已撤销这次写入，还原 {payload.get('undone')} 笔",
+            'note': f"已撤销这次写入，还原 {payload.get('undone')} 笔。"
+                    '回复里说清撤销了哪几笔、账目现在是什么状态。'}, []
+
+
+# ---------------------------------------------------------------- 模型工具定义
 DEFS = [
     {'type': 'function', 'function': {
         'name': 'propose_entry',
-        'description': '记一笔流水（生成待确认草稿，不会立刻写库）。用户说「记一笔」'
-                       '「帮我加一条」「这笔支出补记一下」时用。金额一律传正数，'
-                       '用 direction 区分收支。草稿会以卡片推给用户，他点确认才真正写入。',
+        'description': '记一笔流水。用户说「记一笔」「帮我加一条」「这笔支出补记一下」时用。'
+                       '金额一律传正数，用 direction 区分收支。系统会按当前权限策略决定'
+                       '「直接写入」还是「生成待确认草稿」——以工具返回的 auto 字段为准，'
+                       '不要自己猜是哪种。',
         'parameters': {'type': 'object', 'properties': {
             'account_id': {'type': 'integer', 'description': '账户 id，优先用（从 list_accounts 拿）'},
             'account': {'type': 'string', 'description': '账户名或账号，没有 id 时用'},
@@ -1190,10 +1270,11 @@ DEFS = [
         }, 'required': ['date', 'amount', 'direction']}}},
     {'type': 'function', 'function': {
         'name': 'propose_update_entry',
-        'description': '修改一笔已有流水的草稿（不会立刻写库）。只传要改的字段。'
+        'description': '修改一笔已有流水。只传要改的字段。'
                        '定位方式二选一：① entry_id（先用 query_entries 查到，最稳）；'
                        '② keyword（摘要/对方关键词）+ match_date（原日期），命中唯一一笔才生效。'
-                       '改金额时同时给 amount 与 direction。',
+                       '改金额时同时给 amount 与 direction。系统按权限策略决定直接写入'
+                       '还是生成待确认草稿，以返回的 auto 字段为准。',
         'parameters': {'type': 'object', 'properties': {
             'entry_id': {'type': 'integer', 'description': '要改的流水 id（优先用）'},
             'keyword': {'type': 'string',
@@ -1259,6 +1340,15 @@ DEFS = [
                     'note': {'type': 'string'},
                 }, 'required': ['date', 'amount']}},
         }, 'required': ['entries']}}},
+    {'type': 'function', 'function': {
+        'name': 'undo_write',
+        'description': '撤销一次已经落库的写入（回滚到写入前的状态）。用户说「撤回去」'
+                       '「刚才那笔记错了，撤回」「恢复原样」时用。不传 wid 就撤销本会话'
+                       '最近一次写入。只对新增/修改/删除流水有效。',
+        'parameters': {'type': 'object', 'properties': {
+            'wid': {'type': 'string',
+                    'description': '要撤销的写入 id；省略=最近一次'},
+        }, 'required': []}}},
 ]
 
 WRITE_TOOLS = DEFS
@@ -1268,11 +1358,13 @@ WRITE_IMPL = {
     'propose_delete_entries': w_propose_delete,
     'import_file': w_import_file,
     'propose_import': w_propose_import,
+    'undo_write': w_undo,
 }
 WRITE_LABELS = {
-    'propose_entry': '起草一笔流水',
-    'propose_update_entry': '起草修改',
+    'propose_entry': '写入一笔流水',
+    'propose_update_entry': '修改流水',
     'propose_delete_entries': '起草删除',
     'import_file': '解析对账单',
     'propose_import': '起草批量导入',
+    'undo_write': '撤销上次写入',
 }

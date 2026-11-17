@@ -352,12 +352,21 @@ def pending_block(sid):
             '不能只回复「已修改」。')
 
 
+def perm_block():
+    """把当前权限策略告诉模型，它才知道自己能不能直接落库。"""
+    try:
+        from agent_perm import describe
+        return '\n\n## 你当前的权限\n' + describe()
+    except Exception:
+        return ''
+
+
 def build_system(sid, company, att_block=''):
     try:
         tmpl = load_system_template()
     except Exception:
         tmpl = ''
-    extra = (att_block or '') + facts_block(sid) + pending_block(sid)
+    extra = (att_block or '') + perm_block() + facts_block(sid) + pending_block(sid)
     out = tmpl.replace('{today}', date.today().isoformat())
     out = out.replace('{company}', company or '（未设置）')
     out = out.replace('{extra}', extra)
@@ -466,6 +475,16 @@ def digest_of(name, args, result):
         if name in WRITE_NAMES:
             if result.get('error'):
                 return ''
+            if result.get('auto'):        # 直写落库了
+                w = len(result.get('warnings') or [])
+                body = str(result.get('draft') or result.get('message') or '')[:120]
+                return ('已直接写入：' + body
+                        + (f'（{w} 条提醒）' if w else '')
+                        + (f" · {result.get('wid')}" if result.get('wid') else ''))
+            if not result.get('draft'):
+                msg = str(result.get('message') or result.get('note') or '')
+                if msg:                       # 管理类 / 撤销类：直接报结果
+                    return msg[:160]
             n = result.get('count') or 0
             w = len(result.get('warnings') or [])
             return (f"已生成草稿：{result.get('draft', '')[:120]}"
@@ -542,7 +561,10 @@ def run_agent_stream(cfg, sid, history, text, atts=None):
         messages.append({'role': 'user',
                          'content': build_user_content(text, atts, cfg)})
 
-        tools = pick_tools(route.get('tools'), route.get('write', False))
+        # 全权限：进入 agent 模式就挂上全部工具（查询 + 写入 + 系统维护），
+        # 由模型按用户意图自选，不再按关键词裁剪工具面。
+        tools = (pick_tools(None, True) if route['mode'] == 'agent'
+                 else pick_tools(route.get('tools'), False))
         usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
         auto_links, pushed_links = [], []
         emitted_proposal = False

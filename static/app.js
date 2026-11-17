@@ -158,7 +158,7 @@ function reminderModalHTML(list){
       <div class="modal-actions"><button class="btn" data-action="modal-close">关闭</button></div>`;
   }
   return modalHead(`🔔 待办提醒（${list.length} 笔）`)+`
-    <div class="hint mb">先按公司、再按标签分类；带备注但无标签的归入“备注提醒”。勾选“不再提示”会先二次确认，确认后清空该笔的备注与标签。</div>
+    <div class="hint mb">先按公司、再按标签分类；带备注但无标签的归入“备注提醒”。点「详情」就地看完整信息和改兑现状态，不用跳页。</div>
     <div id="remList" style="max-height:62vh;overflow:auto">
     ${reminderGroups(list).map(c=>`
       <div class="rem-company">
@@ -173,11 +173,16 @@ function reminderModalHTML(list){
             ${g.items.map(r=>`
               <div class="note-remind-item" data-rid="${r.id}">
                 <div class="nr-info">
-                  <div class="nr-line"><b>${esc(r.date)}</b>　<span class="muted">${esc(r.account_name)}</span></div>
-                  <div class="nr-line">${esc(r.description)}</div>
+                  <div class="nr-line">
+                    <b>${esc(r.date)}</b>　<span class="muted">${esc(r.account_name)}</span>
+                    ${r.pending ? '<span class="nr-pend on">未兑现</span>'
+                                : '<span class="nr-pend">已兑现</span>'}
+                  </div>
+                  <div class="nr-line">${esc(r.description)}
+                    ${(r.debit||r.credit) ? `<b class="${r.debit?'green':'red'}" style="margin-left:6px">${fmt(r.debit||r.credit)}</b>` : ''}</div>
                   <div class="nr-line nr-note">${tagChips(r.tags)}${r.note?`<span>📝 ${esc(r.note)}</span>`:''}</div>
                 </div>
-                <button class="btn sm primary" data-action="note-goto" data-id="${r.id}" data-acc="${r.account_id}" data-company="${r.company_id}">查看流水</button>
+                <button class="btn sm primary" data-action="note-detail" data-id="${r.id}">详情</button>
                 <label class="small" title="确认后将清空该笔的备注和标签" style="display:flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap">
                   <input type="checkbox" data-change="note-dismiss" data-id="${r.id}" style="width:15px;height:15px">不再提示</label>
               </div>`).join('')}
@@ -185,6 +190,41 @@ function reminderModalHTML(list){
       </div>`).join('')}
     </div>
     <div class="modal-actions"><button class="btn" data-action="modal-close">关闭</button></div>`;
+}
+/* 单笔详情弹窗：就地看全部字段 + 直接改兑现状态，不跳日记账 */
+function reminderDetailHTML(r){
+  const isIn = !!(r.debit);
+  const amt = r.debit || r.credit || 0;
+  const line = (k, v) => (v === '' || v === null || v === undefined)
+    ? '' : `<div class="rd-row"><span class="rd-k">${k}</span><span class="rd-v">${esc(String(v))}</span></div>`;
+  const acct = (r.account_name || '') + (r.currency ? `（${r.currency}）` : '');
+  return modalHead('📄 流水详情') + `
+    <div class="rd">
+      <div class="rd-top">
+        <div class="rd-amt ${isIn?'green':'red'}">${isIn?'＋':'－'} ${r.currency||''} ${fmt(amt)}</div>
+        <div class="rd-sub">${esc(r.date||'')}　${esc(r.company_name||'')}</div>
+      </div>
+      ${line('摘要', r.description)}
+      ${line('对方', r.party)}
+      ${line('项目', r.project)}
+      ${line('账户', acct)}
+      ${line('支票号', r.check_no)}
+      ${(r.tags||[]).length ? `<div class="rd-row"><span class="rd-k">标签</span>
+        <span class="rd-v">${tagChips(r.tags)}</span></div>` : ''}
+      ${line('备注', r.note)}
+      <div class="rd-row"><span class="rd-k">兑现状态</span>
+        <span class="rd-v">
+          <span class="nr-pend ${r.pending?'on':''}">${r.pending?'未兑现 / 未到账':'已兑现'}</span>
+          <button class="btn sm" data-action="note-toggle-pending" data-id="${r.id}"
+            data-pending="${r.pending?1:0}">${r.pending?'标记为已兑现':'标记为未兑现'}</button>
+        </span>
+      </div>
+      <div class="rd-row"><span class="rd-k">流水号</span><span class="rd-v muted">#${r.id}</span></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" data-action="note-back">← 返回提醒列表</button>
+      <button class="btn" data-action="modal-close">关闭</button>
+    </div>`;
 }
 function renderReminderModal(){
   const list = activeReminders();
@@ -2261,6 +2301,26 @@ function agPropItemsHTML(p, mi, pi){
       data-mi="${mi}" data-pi="${pi}" data-i="${i}" data-k="${k}"
       value="${esc(String(v))}">`;
   };
+  const ex = !!p.expanded;              // 展开后显示不截断的完整字段
+  const detailOf = (it) => {
+    const parts = [];
+    const add = (k, v) => {
+      if(v === undefined || v === null) return;
+      const s = String(v).trim();
+      if(s) parts.push(`<span class="ag-dt"><i>${k}</i>${esc(s)}</span>`);
+    };
+    if(!it.description) add('摘要', it.summary);   // 删除卡的摘要只在详情里
+    add('对方', it.party);
+    add('账户', it.account_name);
+    add('币种', it.currency);
+    add('项目', it.project);
+    add('备注', it.note);
+    add('支票号', it.check_no);
+    add('标签', (it.tag_names || []).join('、'));
+    if(it.entry_id) add('流水号', '#' + it.entry_id);
+    if(it.pending) add('状态', '未兑现 / 未到账');
+    return parts.length ? `<div class="ag-dt-box">${parts.join('')}</div>` : '';
+  };
   if(p.kind === 'update'){
     const it = items[0] || {};
     // 老卡片没有整行字段：从 changes 里补一份，保证「改字段」能编辑
@@ -2291,15 +2351,20 @@ function agPropItemsHTML(p, mi, pi){
         <div class="ag-chg-meta">${esc(it.account_name||'')} · ${esc(it.currency||'')} · #${it.entry_id}
           · 改完直接点「确认写入」</div>`;
     }
+    const cut = s => {
+      const v = '' + (s || '');
+      return ex ? v : v.slice(0, 60);
+    };
     return `<div class="ag-prop-chg">${(it.changes || []).map(c => `
       <div class="ag-chg">
         <span class="ag-chg-l">${esc(c.label)}</span>
-        <span class="ag-chg-f">${esc(('' + (c.from||'')).slice(0,60) || '—')}</span>
+        <span class="ag-chg-f">${esc(cut(c.from) || '—')}</span>
         <span class="ag-chg-a">→</span>
-        <span class="ag-chg-t">${esc(('' + (c.to||'')).slice(0,60))}</span>
+        <span class="ag-chg-t">${esc(cut(c.to))}</span>
       </div>`).join('')}
       <div class="ag-chg-meta">${esc(it.account_name||'')} · ${esc(it.currency||'')}
-        · ${esc(it.date||'')} · #${it.entry_id}</div></div>`;
+        · ${esc(it.date||'')} · #${it.entry_id}</div>
+      ${ex ? detailOf(it) : ''}</div>`;
   }
   const rows = items.map((it, i) => {
     const dir = agPropDir(it);
@@ -2316,15 +2381,17 @@ function agPropItemsHTML(p, mi, pi){
         </td>
       </tr>`;
     }
-    return `<tr>
+    const desc = it.description || '';
+    const main = `<tr>
       <td class="nowrap">${esc(it.date||'')}</td>
       <td class="${dir==='in'?'green':'red'}">${dir==='in'?'收':'支'}</td>
       <td class="num ${dir==='in'?'green':'red'}">${fmt(agPropMoney(it))}</td>
       <td class="ag-prop-desc">
-        <div class="ag-prop-d1">${esc((it.description||'').slice(0,40) || '—')}</div>
-        ${it.party?`<div class="ag-prop-d2">${esc(it.party.slice(0,24))}</div>`:''}
+        <div class="ag-prop-d1">${esc(ex ? (desc || '—') : (desc.slice(0,40) || '—'))}</div>
+        ${it.party?`<div class="ag-prop-d2">${esc(ex ? it.party : it.party.slice(0,24))}</div>`:''}
       </td>
     </tr>`;
+    return main + (ex ? `<tr class="ag-prop-x"><td colspan="4">${detailOf(it)}</td></tr>` : '');
   }).join('');
   const head = '<th>日期</th><th>收支</th><th class="num">金额</th><th>摘要 / 对方</th>';
   const sumIn = items.reduce((s, it) => s + (it.debit || (it.direction==='in' ? it.amount||0 : 0)), 0);
@@ -2340,9 +2407,11 @@ function agProposalHTML(p, mi, pi){
   const stTxt = (p.replaced && st === 'cancelled') ? '已作废'
     : ({pending:'待确认', done:'已写入', undone:'已撤销',
         cancelled:'已取消', failed:'未写入'}[st] || st);
-  const head = `<div class="ag-prop-h">
+  const head = `<div class="ag-prop-h" data-action="prop-expand" data-mi="${mi}" data-pi="${pi}"
+      title="点击展开完整信息">
       <span class="ag-prop-ico">${st === 'pending' ? (p.danger ? '⚠️' : '📝') : (st === 'done' ? '✓' : '·')}</span>
       <span class="ag-prop-t">${esc(p.title || AG_PROP_KIND[p.kind] || '写入草稿')}</span>
+      <span class="ag-prop-x">${p.expanded ? '收起 ⌃' : '详情 ⌄'}</span>
       <span class="ag-prop-st ${st}">${esc(stTxt)}</span>
     </div>`;
   if(st !== 'pending'){
@@ -2352,10 +2421,11 @@ function agProposalHTML(p, mi, pi){
       : st === 'undone' ? '已撤销，数据回到这次写入之前'
       : st === 'failed' ? '没有写入任何记录'
       : (p.replaced ? '已被新的草稿替代，以下面那张卡片为准' : '已取消，账本没有变化');
-    return `<div class="ag-prop ${st} ${p.danger?'danger':''}">${head}
+    return `<div class="ag-prop ${st} ${p.danger?'danger':''}${p.expanded?' open':''}">${head}
       <div class="ag-prop-res">${esc(line)}
         ${(r.fails||[]).length ? `<div class="muted small">${esc((r.fails||[]).slice(0,3).join('；'))}</div>`:''}
       </div>
+      ${p.expanded ? agPropItemsHTML(p, mi, pi) : ''}
       ${st === 'done' && r.wid ? `<div class="ag-prop-f">
         <button class="btn sm" data-action="prop-undo" data-mi="${mi}" data-pi="${pi}">撤销这次写入</button>
       </div>` : ''}</div>`;
@@ -2369,7 +2439,7 @@ function agProposalHTML(p, mi, pi){
       <input type="checkbox" class="ag-ack" data-mi="${mi}" data-pi="${pi}" ${p.ack?'checked':''}>
       我已核对，确认删除这几笔</label>` : '';
   const okTxt = p.danger ? `确认删除 ${(p.items||[]).length} 笔` : '确认写入';
-  return `<div class="ag-prop ${p.danger?'danger':''}">${head}
+  return `<div class="ag-prop ${p.danger?'danger':''}${p.expanded?' open':''}">${head}
     ${warnHTML}
     ${agPropItemsHTML(p, mi, pi)}
     ${ack}
@@ -3053,6 +3123,18 @@ document.addEventListener('click', async e=>{
         agentSaveMsgs(); agentPaintAtts(); agentPaint(); break;
       }
       case 'agent-settings': agentClose(); switchView('settings'); break;
+      case 'prop-expand': {
+        const p = agProp(el.dataset.mi, el.dataset.pi);
+        if(!p) break;
+        p.expanded = !p.expanded;
+        // agentPaint 会强制滚到底，这里记住原位置：在底部就跟着到底，翻历史就留在原处
+        const box = $('#agentChat');
+        const prevTop = box ? box.scrollTop : 0;
+        const nearBottom = box && (box.scrollHeight - box.scrollTop - box.clientHeight < 120);
+        agentPaint();
+        if(box) box.scrollTop = nearBottom ? box.scrollHeight : prevTop;
+        break;
+      }
       case 'prop-confirm': await agPropConfirm(el.dataset.mi, el.dataset.pi); break;
       case 'prop-cancel': await agPropCancel(el.dataset.mi, el.dataset.pi); break;
       case 'prop-undo': await agPropUndo(el.dataset.mi, el.dataset.pi); break;
@@ -3139,6 +3221,25 @@ document.addEventListener('click', async e=>{
         await refreshBootstrap(); $('#companySelect').value=S.company;
         S.jr={accId,account:null,entries:[],loaded:false,from:el.dataset.month+'-01',to:monthEndStr(el.dataset.month),preset:'custom',q:'',status:'',tagId:''};
         closeModal(); switchView('journal'); break;
+      }
+      case 'note-detail': {
+        const r = (S.reminders||[]).find(x=>x.id === +el.dataset.id);
+        if(!r) break;
+        modalBox.innerHTML = reminderDetailHTML(r);
+        break;
+      }
+      case 'note-back': renderReminderModal(); break;
+      case 'note-toggle-pending': {
+        const id = +el.dataset.id;
+        const next = el.dataset.pending === '1' ? 0 : 1;
+        el.disabled = true;
+        try{ await jput('/api/entries/'+id+'/pending', {pending: next}); }
+        catch(err){ el.disabled = false; alert('修改失败：'+err.message); break; }
+        await loadReminders();
+        const r = (S.reminders||[]).find(x=>x.id === id);
+        if(r) modalBox.innerHTML = reminderDetailHTML(r);
+        else renderReminderModal();
+        break;
       }
       case 'note-goto': {
         const accId = +el.dataset.acc, entryId = +el.dataset.id;
