@@ -172,7 +172,10 @@ button{font-family:inherit}
 /* ---------- 标签备注启动提醒 ---------- */
 .note-remind-item{display:flex;align-items:center;gap:12px;padding:10px 6px;border-bottom:1px solid #f1f5f9}
 .note-remind-item:last-child{border-bottom:none}
-.note-remind-item .nr-info{flex:1;min-width:0;font-size:13px}
+.note-remind-item .nr-info{flex:1;min-width:0;font-size:13px;cursor:pointer;border-radius:6px;
+  transition:background .12s}
+.note-remind-item .nr-info:hover{background:#f8fafc}
+.note-remind-item .nr-info:hover .nr-line:not(.nr-note){color:#0f172a}
 .note-remind-item .nr-line{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.7}
 .note-remind-item .nr-note{color:var(--amber);font-weight:600}
 .rem-company{margin-bottom:16px}
@@ -182,6 +185,9 @@ button{font-family:inherit}
 .rem-group-head{display:flex;align-items:center;gap:8px;padding:8px 10px;
   background:#f8fafc;border-bottom:1px solid #eef2f7}
 .rem-group .note-remind-item{padding:9px 10px}
+/* 列表顶部的一行轻提示：不用弹窗打断 */
+.rem-tip{margin:0 0 10px;padding:7px 10px;border-radius:8px;font-size:12.5px;
+  background:#ecfdf5;color:#15803d;border:1px solid #d1fae5}
 /* 兑现状态徽章：绿=已兑现，橙=未兑现 */
 .nr-pend{flex:0 0 auto;margin-left:8px;font-size:10.5px;padding:1px 6px;
   border-radius:99px;background:#dcfce7;color:#15803d;font-weight:600;
@@ -199,6 +205,15 @@ button{font-family:inherit}
 .rd-k{flex:0 0 68px;color:#94a3b8;font-size:12px}
 .rd-v{flex:1;min-width:0;color:#1e293b;word-break:break-all;line-height:1.6}
 .rd-v .tagchip{margin-right:4px}
+/* 详情里就地改标签：点一下切换选中 */
+.rem-tagbox{display:flex;flex-wrap:wrap;gap:6px;padding:2px 0}
+.rem-tag{cursor:pointer;user-select:none;opacity:.45;filter:grayscale(.35);transition:opacity .12s}
+.rem-tag:hover{opacity:.8}
+.rem-tag.on{opacity:1;filter:none;box-shadow:0 0 0 2px #fff,0 0 0 3px #0f172a}
+.rd-row.edit{align-items:flex-start}
+.rd-row.edit .rd-k{padding-top:5px}
+.rd-v textarea.inp{width:100%;resize:vertical;font-size:13px;line-height:1.6}
+.mt4{margin-top:4px}
 
 /* ---------- dropzone ---------- */
 .dropzone{border:2px dashed #cbd5e1;border-radius:10px;padding:16px;text-align:center;color:var(--muted);

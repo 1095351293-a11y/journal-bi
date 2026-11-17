@@ -158,7 +158,8 @@ function reminderModalHTML(list){
       <div class="modal-actions"><button class="btn" data-action="modal-close">关闭</button></div>`;
   }
   return modalHead(`🔔 待办提醒（${list.length} 笔）`)+`
-    <div class="hint mb">先按公司、再按标签分类；带备注但无标签的归入“备注提醒”。点「详情」就地看完整信息和改兑现状态，不用跳页。</div>
+    <div class="hint mb">先按公司、再按标签分类；带备注但无标签的归入“备注提醒”。点任意一笔的文字即可看详情、改标签和备注。</div>
+    <div id="remListTip" class="rem-tip" style="display:none"></div>
     <div id="remList" style="max-height:62vh;overflow:auto">
     ${reminderGroups(list).map(c=>`
       <div class="rem-company">
@@ -172,7 +173,8 @@ function reminderModalHTML(list){
             </div>
             ${g.items.map(r=>`
               <div class="note-remind-item" data-rid="${r.id}">
-                <div class="nr-info">
+                <div class="nr-info" data-action="note-detail" data-id="${r.id}"
+                     title="点击任意文字查看详情">
                   <div class="nr-line">
                     <b>${esc(r.date)}</b>　<span class="muted">${esc(r.account_name)}</span>
                     ${r.pending ? '<span class="nr-pend on">未兑现</span>'
@@ -191,10 +193,83 @@ function reminderModalHTML(list){
     </div>
     <div class="modal-actions"><button class="btn" data-action="modal-close">关闭</button></div>`;
 }
-/* 单笔详情弹窗：就地看全部字段 + 直接改兑现状态，不跳日记账 */
+/* 详情弹窗里的标签选择器（点一下切换选中） */
+function remTagChipsHTML(sel){
+  const tags = S.tags || [];
+  if(!tags.length) return '<span class="muted small">还没有标签，可到「公司与账户」页新建</span>';
+  return tags.map(t=>{
+    const on = sel.has(t.id);
+    return `<span class="tagchip rem-tag${on?' on':''}" data-action="rem-tag-toggle"
+      data-id="${t.id}" data-name="${esc(t.name)}" style="background:${t.color}"
+      >${on?'✓ ':''}${esc(t.name)}</span>`;
+  }).join('');
+}
+/* 当前详情页的编辑草稿：{id, note, tagIds:Set, baseNote, baseTags}
+   base* 是"服务端已知值"，用来判断有没有未保存改动 */
+let remDraft = null;
+function remDraftOf(r){
+  if(!remDraft || remDraft.id !== r.id){
+    const tags = (r.tags||[]).map(t=>t.id);
+    remDraft = {id: r.id, note: r.note || '', tagIds: new Set(tags),
+                baseNote: r.note || '', baseTags: tags.slice()};
+  }
+  return remDraft;
+}
+function remIsDirty(){
+  if(!remDraft) return false;
+  const a = (remDraft.baseTags||[]).slice().sort().join(',');
+  const b = [...remDraft.tagIds].sort().join(',');
+  return a !== b || (remDraft.note||'') !== (remDraft.baseNote||'');
+}
+function syncRemSaveBtn(){
+  const btn = $('#remSaveBtn');
+  if(!btn) return;
+  const dirty = remIsDirty();
+  btn.className = 'btn' + (dirty ? ' primary' : '');
+  btn.textContent = dirty ? '立即保存' : '保存';
+  btn.disabled = !dirty;
+}
+/* 点「立即保存」才落库；存完关掉详情、回到提醒列表 */
+async function doRemSave(r){
+  if(!remDraft || remDraft.id !== r.id) return false;
+  const payload = {note: remDraft.note || '', tag_ids: [...remDraft.tagIds]};
+  try{
+    await jput('/api/entries/'+r.id, payload);
+  }catch(err){
+    alert('保存失败：'+err.message);
+    return false;
+  }
+  const cleared = !(payload.note||'').trim() && payload.tag_ids.length === 0;
+  remDraft = null;
+  await loadReminders();
+  const still = (S.reminders||[]).some(x=>x.id === r.id);
+  renderReminderModal();
+  if(!still && cleared){
+    remListTip('已保存。这笔已无标签和备注，所以从提醒列表移除了。');
+  }
+  return true;
+}
+function remListTip(msg){
+  const box = $('#remListTip');
+  if(!box) return;
+  box.textContent = msg;
+  box.style.display = 'block';
+  clearTimeout(remListTip._t);
+  remListTip._t = setTimeout(()=>{ box.style.display = 'none'; }, 3200);
+}
+function bindRemNote(r){
+  const ta = $('#remNote');
+  if(!ta) return;
+  ta.addEventListener('input', ()=>{
+    remDraftOf(r).note = ta.value;
+    syncRemSaveBtn();
+  });
+}
+/* 单笔详情弹窗：就地看全部字段 + 改兑现状态 + 改标签备注，不跳日记账 */
 function reminderDetailHTML(r){
   const isIn = !!(r.debit);
   const amt = r.debit || r.credit || 0;
+  const d = remDraftOf(r);
   const line = (k, v) => (v === '' || v === null || v === undefined)
     ? '' : `<div class="rd-row"><span class="rd-k">${k}</span><span class="rd-v">${esc(String(v))}</span></div>`;
   const acct = (r.account_name || '') + (r.currency ? `（${r.currency}）` : '');
@@ -209,9 +284,21 @@ function reminderDetailHTML(r){
       ${line('项目', r.project)}
       ${line('账户', acct)}
       ${line('支票号', r.check_no)}
-      ${(r.tags||[]).length ? `<div class="rd-row"><span class="rd-k">标签</span>
-        <span class="rd-v">${tagChips(r.tags)}</span></div>` : ''}
-      ${line('备注', r.note)}
+      <div class="rd-row edit"><span class="rd-k">标签</span>
+        <span class="rd-v">
+          <div class="rem-tagbox" id="remTagBox">${remTagChipsHTML(d.tagIds)}</div>
+          <div class="muted small mt4" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            点标签即增删，改完点「立即保存」
+            <button class="btn sm" data-action="rem-tag-new">＋ 新标签</button>
+          </div>
+        </span>
+      </div>
+      <div class="rd-row edit"><span class="rd-k">备注</span>
+        <span class="rd-v">
+          <textarea class="inp" id="remNote" rows="2"
+            placeholder="例如：待客户确认、下月跟进、款项用途…">${esc(d.note)}</textarea>
+        </span>
+      </div>
       <div class="rd-row"><span class="rd-k">兑现状态</span>
         <span class="rd-v">
           <span class="nr-pend ${r.pending?'on':''}">${r.pending?'未兑现 / 未到账':'已兑现'}</span>
@@ -223,15 +310,28 @@ function reminderDetailHTML(r){
     </div>
     <div class="modal-actions">
       <button class="btn" data-action="note-back">← 返回提醒列表</button>
-      <button class="btn" data-action="modal-close">关闭</button>
+      <button class="btn" data-action="rem-save" data-id="${r.id}" id="remSaveBtn"
+        ${remIsDirty()?'':'disabled'}>${remIsDirty()?'立即保存':'保存'}</button>
+      <button class="btn" data-action="note-close">关闭</button>
     </div>`;
 }
-function renderReminderModal(){
+/* 记住提醒列表的滚动位置，重绘后回到原处 */
+let remScrollTop = 0;
+function renderReminderModal(resetScroll){
   const list = activeReminders();
+  if(resetScroll){
+    remScrollTop = 0;
+  }else{
+    const old = $('#remList');
+    if(old) remScrollTop = old.scrollTop;
+  }
   modalBox.innerHTML = reminderModalHTML(list);
   renderRemBadge();
   const box = $('#remList');
   if(!box) return;
+  box.scrollTop = remScrollTop;
+  requestAnimationFrame(()=>{ if(box.isConnected) box.scrollTop = remScrollTop; });
+  box.addEventListener('scroll', ()=>{ remScrollTop = box.scrollTop; });
   box.addEventListener('change', async ev=>{
     const cb = ev.target.closest('[data-change="note-dismiss"]');
     if(!cb) return;
@@ -252,7 +352,7 @@ function renderReminderModal(){
 }
 function openReminderModal(){
   overlay.classList.remove('hidden');
-  renderReminderModal();
+  renderReminderModal(true);   // 每次打开都从顶部开始
 }
 async function refreshBootstrap(){
   const b = await api('/api/bootstrap');
@@ -3225,10 +3325,82 @@ document.addEventListener('click', async e=>{
       case 'note-detail': {
         const r = (S.reminders||[]).find(x=>x.id === +el.dataset.id);
         if(!r) break;
+        // 详情会替换掉列表 DOM，先把滚动位置存下来
+        const lb = $('#remList');
+        if(lb) remScrollTop = lb.scrollTop;
+        remDraft = null;
         modalBox.innerHTML = reminderDetailHTML(r);
+        bindRemNote(r);
         break;
       }
-      case 'note-back': renderReminderModal(); break;
+      case 'rem-tag-toggle': {
+        if(!remDraft) break;
+        const tid = +el.dataset.id;
+        const name = el.dataset.name || el.textContent.replace(/^✓\s*/, '').trim();
+        const on = !remDraft.tagIds.has(tid);
+        if(on) remDraft.tagIds.add(tid); else remDraft.tagIds.delete(tid);
+        // 只改这一个 chip，不重建整块——否则连续点击会点到已被替换的旧节点
+        el.classList.toggle('on', on);
+        el.textContent = (on ? '✓ ' : '') + name;
+        el.dataset.name = name;
+        syncRemSaveBtn();
+        break;
+      }
+      case 'rem-tag-new': {
+        if(!remDraft) break;
+        const name = (prompt('新标签名称（例如：待补发票）') || '').trim();
+        if(!name) break;
+        if((S.tags||[]).some(t=>t.name === name)){
+          const exist = S.tags.find(t=>t.name === name);
+          remDraft.tagIds.add(exist.id);
+          const box = $('#remTagBox');
+          const chip = box && box.querySelector(`.rem-tag[data-id="${exist.id}"]`);
+          if(chip && !chip.classList.contains('on')){
+            chip.classList.add('on');
+            chip.textContent = '✓ ' + exist.name;
+          }
+          syncRemSaveBtn();
+          break;
+        }
+        try{
+          const t = await jpost('/api/tags', {name, color: '#3b82f6'});
+          S.tags.push(t);
+          remDraft.tagIds.add(t.id);
+          const box = $('#remTagBox');
+          if(box){
+            const empty = box.querySelector('.muted');
+            if(empty) empty.remove();
+            box.insertAdjacentHTML('beforeend',
+              `<span class="tagchip rem-tag on" data-action="rem-tag-toggle"
+                data-id="${t.id}" data-name="${esc(t.name)}" style="background:${t.color}"
+                >✓ ${esc(t.name)}</span>`);
+          }
+          syncRemSaveBtn();
+        }catch(err){ alert('新建标签失败：'+err.message); }
+        break;
+      }
+      case 'rem-save': {
+        const r = (S.reminders||[]).find(x=>x.id === +el.dataset.id);
+        if(!r || !remDraft) break;
+        el.disabled = true;
+        await doRemSave(r);
+        break;
+      }
+      case 'note-close': {
+        if(remDraft && remIsDirty() &&
+           !confirm('标签或备注的改动还没保存，关闭就丢弃了。\n\n确定关闭？')) break;
+        remDraft = null;
+        closeModal();
+        break;
+      }
+      case 'note-back': {
+        // 有未保存改动时先问一句，避免"改了标签点返回就悄悄丢了"
+        if(remDraft && remIsDirty() &&
+           !confirm('标签或备注的改动还没保存，返回就丢弃了。\n\n确定不保存就返回？')) break;
+        remDraft = null;
+        renderReminderModal();
+        break;
+      }
       case 'note-toggle-pending': {
         const id = +el.dataset.id;
         const next = el.dataset.pending === '1' ? 0 : 1;
@@ -3237,7 +3409,7 @@ document.addEventListener('click', async e=>{
         catch(err){ el.disabled = false; alert('修改失败：'+err.message); break; }
         await loadReminders();
         const r = (S.reminders||[]).find(x=>x.id === id);
-        if(r) modalBox.innerHTML = reminderDetailHTML(r);
+        if(r){ modalBox.innerHTML = reminderDetailHTML(r); bindRemNote(r); }
         else renderReminderModal();
         break;
       }
