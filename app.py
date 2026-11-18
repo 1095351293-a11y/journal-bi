@@ -113,6 +113,13 @@ def init_db():
     con = sqlite3.connect(DB_PATH)
     con.executescript(SCHEMA)
     con.commit()
+    # 空库提示：直接 python app.py 不会生成演示数据，别让人以为是程序坏了
+    try:
+        if not con.execute('SELECT 1 FROM companies LIMIT 1').fetchone():
+            print('[提示] 账本是空的。想先看界面效果，先运行：'
+                  'python tools/gen_demo_data.py（或用 start.bat / start.sh 启动）')
+    except Exception:
+        pass
     con.close()
 
 
