@@ -30,6 +30,8 @@ const accById  = id => S.accounts.find(a=>a.id===id);
 let jrGroupMonth = false;
 /* 日记账两段（已入账 / 未兑现）的收起状态：收起只藏明细，段头与小计仍可见 */
 let jrFold = { booked:false, pend:false };
+/* 组合分录：哪些父行的明细已在表格里展开 */
+let jrOpenItems = new Set();
 /* 「全部公司」：S.company 为字符串 'all'，其余情况仍是公司 id 数字 */
 const isAllCo  = () => S.company === 'all';
 const coAccs   = () => isAllCo() ? S.accounts : S.accounts.filter(a=>a.company_id===S.company);
@@ -1241,12 +1243,15 @@ async function renderJournal(){
 
 function journalRow(e, sec){
   const outOfRange = e.pending && ((S.jr.from && e.date < S.jr.from) || (S.jr.to && e.date > S.jr.to));
+  const nItem = (e.items||[]).length;
+  const combo = nItem > 1;
+  const open = combo && jrOpenItems.has(e.id);
   return `
-    <tr class="${e.pending?'pendrow':''}" data-sec="${sec||(e.pending?'pend':'booked')}" data-action="entry-edit" data-id="${e.id}">
+    <tr class="${e.pending?'pendrow':''}${combo?' combo-row':''}" data-sec="${sec||(e.pending?'pend':'booked')}" data-action="entry-edit" data-id="${e.id}">
       <td class="chk-cell">${e.pending?`<input type="checkbox" data-change="jr-pend-check" data-id="${e.id}" onclick="event.stopPropagation()">`:''}</td>
       <td style="white-space:nowrap">${esc(e.date)}${outOfRange?'<span class="cur-chip" title="不在上方所选日期范围内">非本期</span>':''}</td>
       <td style="white-space:nowrap">${esc(e.check_no)}</td>
-      <td class="desc-cell">${esc(e.description)}${e.party?`<div class="party">对方：${esc(e.party)}</div>`:''}${e.project?`<div class="party">项目：${esc(e.project)}</div>`:''}</td>
+      <td class="desc-cell">${esc(e.description)}${combo?`<span class="item-badge" data-action="entry-items" data-id="${e.id}" title="这笔是多笔合记，点开看小明细">${open?'▾':'▸'} 🧩 ${nItem} 笔</span>`:''}${e.party?`<div class="party">对方：${esc(e.party)}</div>`:''}${e.project?`<div class="party">项目：${esc(e.project)}</div>`:''}</td>
       <td class="num green">${e.debit?fmt(e.debit):''}</td>
       <td class="num red">${e.credit?fmt(e.credit):''}</td>
       <td class="num">${e.pending?'<span class="muted">—</span>':fmt(e._bbal)}</td>
@@ -1254,7 +1259,24 @@ function journalRow(e, sec){
       <td>${e.attachments.length?`<button class="attach-btn" data-action="entry-att" data-id="${e.id}">📎${e.attachments.length}</button>`:''}</td>
       <td>${badge(e)}</td>
       <td><button class="btn sm danger" data-action="entry-del" data-id="${e.id}">删除</button></td>
-    </tr>`;
+    </tr>` + (open ? itemRows(e, sec) : '');
+}
+
+/* 组合分录的小明细行：金额随父行方向落列，余额列不重复计算（父行才是账上的那一笔）
+   序号用 ①②③ 与导出 Excel 里的标号保持一致 */
+const ITEM_MARK = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳';
+function itemRows(e, sec){
+  return (e.items||[]).map((it,i)=>`
+    <tr class="item-row" data-sec="${sec||(e.pending?'pend':'booked')}" data-action="entry-edit" data-id="${e.id}">
+      <td></td>
+      <td></td>
+      <td></td>
+      <td class="desc-cell"><span class="item-seq">${ITEM_MARK[i] || ('('+(i+1)+')')}</span>${esc(it.description||'(无摘要)')}${it.party?`<div class="party">对方：${esc(it.party)}</div>`:''}</td>
+      <td class="num green">${e.debit?fmt(it.amount):''}</td>
+      <td class="num red">${e.credit?fmt(it.amount):''}</td>
+      <td class="num muted">·</td>
+      <td colspan="4"></td>
+    </tr>`).join('');
 }
 
 function recalcJournalPend(){
@@ -1340,6 +1362,10 @@ function openEntryModal(entryId){
     : S.jr.entries.find(x=>x.id===entryId);
   if(!e) return;
   tmpTags.clear(); e.tags.forEach(t=>tmpTags.add(t.id));
+  // 组合分录的小明细（编辑已有流水时带出来；新增时为空）
+  let items = (e.items||[]).map(it=>({
+    description: it.description||'', party: it.party||'', amount: it.amount||''
+  }));
   const acc = accById(e.account_id) || S.jr.account;
   openModal(modalHead(isNew?'新增流水':`编辑流水 #${e.id}`) + `
     <form id="entryForm" data-eid="${e.id||''}">
@@ -1351,6 +1377,14 @@ function openEntryModal(entryId){
         <div class="field"><label>资金计划项目</label><input class="inp" name="project" value="${esc(e.project)}"></div>
         <div class="field"><label>收入（借方）${esc(acc.currency)}</label><input class="inp" type="number" step="0.01" min="0" name="debit" value="${e.debit||''}" placeholder="0.00"></div>
         <div class="field"><label>支出（贷方）${esc(acc.currency)}</label><input class="inp" type="number" step="0.01" min="0" name="credit" value="${e.credit||''}" placeholder="0.00"></div>
+        <div class="field full">
+          <label style="display:flex;align-items:center;justify-content:space-between">
+            <span>🧩 多笔合记 / 小明细<span class="muted small" style="font-weight:400">　多笔钱记成一笔时用，导出会按小笔逐行展开</span></span>
+            <button type="button" class="btn sm" id="itemAddBtn">＋ 添加小明细</button>
+          </label>
+          <div id="itemEditor" class="item-editor"></div>
+          <div id="itemSumTip" class="hint" style="margin-top:6px"></div>
+        </div>
         <div class="field full">
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--txt)">
             <input type="checkbox" name="pending" id="pendChk" ${e.pending?'checked':''} style="width:16px;height:16px">
@@ -1382,6 +1416,73 @@ function openEntryModal(entryId){
     </form>`);
 
   const form = $('#entryForm');
+
+  /* ---------- 多笔合记：小明细编辑 ---------- */
+  const itemBox = $('#itemEditor'), itemTip = $('#itemSumTip');
+  const validItems = () => items.filter(it=>(parseFloat(it.amount)||0)>0);
+  const itemsTotal = () => validItems().reduce((s,it)=>s+(parseFloat(it.amount)||0),0);
+  const comboActive = () => validItems().length >= 2;   // 至少 2 笔才算组合分录
+  const itemDir = () => {                               // 方向跟随上方金额框
+    const d = parseFloat(form.debit.value)||0, c = parseFloat(form.credit.value)||0;
+    if(d>0 && c<=0) return 'debit';
+    if(c>0 && d<=0) return 'credit';
+    return '';
+  };
+  function paintItemSum(){
+    const total = itemsTotal(), dir = itemDir();
+    if(comboActive()){
+      const dirTxt = dir ? (dir==='debit'?'收入':'支出') : '（⚠️ 请先填上方“收入/支出”金额确定方向）';
+      itemTip.innerHTML = `明细合计 <b>${fmt(total)}</b>　·　保存时以明细合计作为本笔金额，方向：${dirTxt}；导出按 ${validItems().length} 笔小明细逐行展开。`;
+    } else if(items.length){
+      itemTip.innerHTML = `已加 ${items.length} 行，合计 <b>${fmt(total)}</b>。至少 2 笔有金额才会按明细合计记账，否则仍是普通一笔。`;
+    } else {
+      itemTip.innerHTML = '';
+    }
+  }
+  function renderItems(){
+    if(!items.length){
+      itemBox.innerHTML = '<div class="hint">还没有小明细。点右上「＋ 添加小明细」，把这一笔拆成多笔（例如：一笔付工资 5 万，拆成每人一行）。</div>';
+    } else {
+      itemBox.innerHTML =
+        `<div class="item-line item-head"><span>#</span><span>小明细摘要</span><span>对方单位</span><span>金额</span><span></span></div>`
+        + items.map((it,i)=>`
+          <div class="item-line" data-i="${i}">
+            <span class="muted small ctr">${i+1}</span>
+            <input class="inp" data-k="description" value="${esc(it.description)}" placeholder="例如：梁烈 10 月工资">
+            <input class="inp" data-k="party" value="${esc(it.party)}" placeholder="对方（可空）">
+            <input class="inp" type="number" step="0.01" min="0" data-k="amount" value="${esc(it.amount)}" placeholder="0.00">
+            <button type="button" class="btn sm danger" data-item-del="${i}" title="删除这行明细">✕</button>
+          </div>`).join('');
+    }
+    paintItemSum();
+  }
+  $('#itemAddBtn').addEventListener('click', ()=>{
+    const last = items[items.length-1];
+    items.push({description:'', party:last?last.party:'', amount:''});
+    renderItems();
+    const lines = $$('.item-line[data-i]', itemBox);
+    lines[lines.length-1]?.querySelector('input')?.focus();
+  });
+  itemBox.addEventListener('input', ev=>{
+    const line = ev.target.closest('.item-line'); if(!line) return;
+    const i = +line.dataset.i, k = ev.target.dataset.k; if(!k) return;
+    items[i][k] = ev.target.value;
+    // 改的是明细金额，且已经够 2 笔 → 顺手把上方金额框同步成合计（不在用户编辑金额框时抢值）
+    if(k==='amount' && comboActive()){
+      const dir = itemDir(), total = itemsTotal();
+      if(dir==='debit') form.debit.value = total.toFixed(2);
+      else if(dir==='credit') form.credit.value = total.toFixed(2);
+    }
+    paintItemSum();
+  });
+  itemBox.addEventListener('click', ev=>{
+    const b = ev.target.closest('[data-item-del]'); if(!b) return;
+    ev.preventDefault(); ev.stopPropagation();
+    items.splice(+b.dataset.itemDel, 1);
+    renderItems();
+  });
+  ['debit','credit'].forEach(k=>form[k].addEventListener('input', paintItemSum));
+  renderItems();
   // 未兑现智能默认：新增时填了支出+单据号 → 自动勾选
   if(isNew){
     const chk=$('#pendChk'); let touched=false;
@@ -1452,8 +1553,19 @@ function openEntryModal(entryId){
   form.addEventListener('submit', async ev=>{
     ev.preventDefault();
     const fd = new FormData(form);
-    const debit = parseFloat(fd.get('debit'))||0, credit = parseFloat(fd.get('credit'))||0;
+    let debit = parseFloat(fd.get('debit'))||0, credit = parseFloat(fd.get('credit'))||0;
     if(debit>0 && credit>0){ alert('收入与支出只能填一项'); return; }
+    // 多笔合记：≥2 笔有效明细 → 本笔金额取明细合计，方向沿用上方填的收入/支出
+    const itms = validItems();
+    const combo = itms.length >= 2;
+    if(combo){
+      const total = +itms.reduce((s,it)=>s+(parseFloat(it.amount)||0),0).toFixed(2);
+      if(!(debit>0) && !(credit>0)){
+        alert('这笔要按多笔明细记账，请先在上方「收入（借方）」或「支出（贷方）」填一个金额来确定方向。');
+        return;
+      }
+      if(debit>0) debit = total; else credit = total;
+    }
     const body = {
       account_id: e.account_id,
       date: fd.get('date'), check_no: fd.get('check_no').trim(),
@@ -1461,6 +1573,11 @@ function openEntryModal(entryId){
       project: fd.get('project').trim(), note: (fd.get('note')||'').trim(),
       debit, credit, pending: form.pending.checked,
       tag_ids: [...tmpTags],
+      items: combo ? itms.map(it=>({
+        description: (it.description||'').trim(),
+        party: (it.party||'').trim(),
+        amount: parseFloat(it.amount)||0,
+      })) : [],
     };
     try{
       let saved;
@@ -3758,6 +3875,13 @@ document.addEventListener('click', async e=>{
       case 'entry-add': tmpTags.clear(); openEntryModal(null); break;
       case 'entry-edit': if(e.target.closest('[data-action]').dataset.action==='entry-edit') openEntryModal(+el.dataset.id); break;
       case 'entry-att': e.stopPropagation(); openEntryModal(+el.dataset.id); break;
+      case 'entry-items': {
+        e.stopPropagation();
+        const eid2 = +el.dataset.id;
+        if(jrOpenItems.has(eid2)) jrOpenItems.delete(eid2); else jrOpenItems.add(eid2);
+        renderJournal();
+        break;
+      }
       case 'entry-del': {
         e.stopPropagation();
         if(!confirm('确定删除这笔流水？其附件也会一并删除。')) break;

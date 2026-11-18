@@ -64,6 +64,17 @@ CREATE TABLE IF NOT EXISTS entries(
   debit REAL NOT NULL DEFAULT 0, credit REAL NOT NULL DEFAULT 0,
   pending INTEGER NOT NULL DEFAULT 0, project TEXT DEFAULT '',
   created_at TEXT);
+-- 组合分录明细：一笔流水可拆成多笔小明细（父记录金额＝明细合计）
+-- 明细金额为绝对值，方向（收/支）继承父记录的 debit/credit；导出时按小笔展开成多行
+CREATE TABLE IF NOT EXISTS entry_items(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entry_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 0,
+  description TEXT DEFAULT '',
+  party TEXT DEFAULT '',
+  amount REAL NOT NULL DEFAULT 0,
+  note TEXT DEFAULT '');
+CREATE INDEX IF NOT EXISTS ix_ei_entry ON entry_items(entry_id);
 CREATE TABLE IF NOT EXISTS entry_tags(
   entry_id INTEGER NOT NULL, tag_id INTEGER NOT NULL, PRIMARY KEY(entry_id, tag_id));
 CREATE TABLE IF NOT EXISTS tags(
@@ -203,15 +214,53 @@ def entry_att_map(db, entry_ids):
     return out
 
 
+def entry_items_map(db, entry_ids):
+    """entry_id -> [明细行]（按 seq, id 排序）"""
+    out = {}
+    if not entry_ids:
+        return out
+    ph = ','.join('?' * len(entry_ids))
+    rows = db.execute(
+        f'SELECT * FROM entry_items WHERE entry_id IN ({ph}) ORDER BY seq, id',
+        entry_ids).fetchall()
+    for r in rows:
+        out.setdefault(r['entry_id'], []).append(rowdict(r))
+    return out
+
+
+def sync_entry_items(db, entry_id, items):
+    """整体替换某笔流水的明细。items 为空 → 清空（该笔退回普通流水）。
+    返回明细合计，供调用方覆盖父记录的 debit/credit。"""
+    db.execute('DELETE FROM entry_items WHERE entry_id=?', (entry_id,))
+    total = 0.0
+    seq = 0
+    for it in items or []:
+        amt = abs(float(it.get('amount') or 0))
+        if amt <= 0:
+            continue
+        seq += 1
+        db.execute(
+            'INSERT INTO entry_items(entry_id,seq,description,party,amount,note) '
+            'VALUES(?,?,?,?,?,?)',
+            (entry_id, seq,
+             str(it.get('description') or '').strip(),
+             str(it.get('party') or '').strip(),
+             round(amt, 2), str(it.get('note') or '').strip()))
+        total += amt
+    return round(total, 2)
+
+
 def serialize_entries(db, rows):
     ids = [r['id'] for r in rows]
     tm = entry_tags_map(db, ids)
     am = entry_att_map(db, ids)
+    im = entry_items_map(db, ids)
     out = []
     for r in rows:
         d = rowdict(r)
         d['tags'] = tm.get(r['id'], [])
         d['attachments'] = am.get(r['id'], [])
+        d['items'] = im.get(r['id'], [])
         out.append(d)
     return out
 
@@ -408,6 +457,8 @@ def _delete_account_db(db, aid):
                 pass
     db.execute('DELETE FROM entry_tags WHERE entry_id IN '
                '(SELECT id FROM entries WHERE account_id=?)', (aid,))
+    db.execute('DELETE FROM entry_items WHERE entry_id IN '
+               '(SELECT id FROM entries WHERE account_id=?)', (aid,))
     db.execute('DELETE FROM attachments WHERE entry_id IN '
                '(SELECT id FROM entries WHERE account_id=?)', (aid,))
     db.execute('DELETE FROM entries WHERE account_id=?', (aid,))
@@ -445,6 +496,10 @@ def add_entry():
     if err:
         return bad(err)
     db = get_db()
+    items = data.get('items') or []
+    items_total = round(sum(abs(float(it.get('amount') or 0)) for it in items), 2)
+    if items_total > 0 and not f['debit'] and not f['credit']:
+        return bad('这笔有多笔明细，请先填收入或支出金额来确定方向')
     with _write_lock:
         cur = db.execute(
             'INSERT INTO entries(account_id,date,check_no,description,party,'
@@ -453,9 +508,16 @@ def add_entry():
             (f['account_id'], f['date'], f['check_no'], f['description'],
              f['party'], f['debit'], f['credit'], f['pending'], f['project'],
              f['note'], now_iso()))
-        set_entry_tags(db, cur.lastrowid, data.get('tag_ids'))
-        db.commit()
         eid = cur.lastrowid
+        if items:
+            total = sync_entry_items(db, eid, items)
+            if total > 0:
+                # 有明细时以明细合计为准，方向沿用该笔填的收入/支出
+                db.execute('UPDATE entries SET debit=?, credit=? WHERE id=?',
+                           (total if f['debit'] else 0,
+                            total if f['credit'] else 0, eid))
+        set_entry_tags(db, eid, data.get('tag_ids'))
+        db.commit()
     row = db.execute('SELECT * FROM entries WHERE id=?', (eid,)).fetchone()
     return jsonify(serialize_entries(db, [row])[0])
 
@@ -472,6 +534,11 @@ def upd_entry(eid):
         return bad(err)
     merged = dict(row)
     merged.update(f)
+    if 'items' in data:
+        items_total = round(sum(abs(float(it.get('amount') or 0))
+                                for it in (data.get('items') or [])), 2)
+        if items_total > 0 and not merged['debit'] and not merged['credit']:
+            return bad('这笔有多笔明细，请先填收入或支出金额来确定方向')
     with _write_lock:
         db.execute(
             'UPDATE entries SET date=?, check_no=?, description=?, party=?, '
@@ -479,6 +546,12 @@ def upd_entry(eid):
             (merged['date'], merged['check_no'], merged['description'],
              merged['party'], merged['debit'], merged['credit'],
              merged['pending'], merged['project'], merged['note'], eid))
+        if 'items' in data:
+            total = sync_entry_items(db, eid, data.get('items'))
+            if total > 0:
+                db.execute('UPDATE entries SET debit=?, credit=? WHERE id=?',
+                           (total if merged['debit'] else 0,
+                            total if merged['credit'] else 0, eid))
         if 'tag_ids' in data:
             set_entry_tags(db, eid, data.get('tag_ids'))
         db.commit()
@@ -511,6 +584,7 @@ def del_entry(eid):
                 except OSError:
                     pass
         db.execute('DELETE FROM entry_tags WHERE entry_id=?', (eid,))
+        db.execute('DELETE FROM entry_items WHERE entry_id=?', (eid,))
         db.execute('DELETE FROM attachments WHERE entry_id=?', (eid,))
         db.execute('DELETE FROM entries WHERE id=?', (eid,))
         db.commit()
@@ -1492,15 +1566,33 @@ def export_excel():
         range_rows = [e for e in all_rows
                       if (not frm or e['date'] >= frm) and (not to or e['date'] <= to)]
         tag_all = entry_tags_map(db, [e['id'] for e in all_rows]) if tag_id else {}
+        # 组合分录明细：有明细的流水导出时按小笔展开成多行
+        items_map = entry_items_map(db, [e['id'] for e in all_rows])
         qq = q.lower()
+
+        CIRC = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'
+
+        def expand(e):
+            """返回 [(item 或 None)]：无明细（或只有 1 笔）＝原样一笔，
+            多笔明细＝按明细逐笔展开（子行金额取明细，摘要取明细摘要）"""
+            its = items_map.get(e['id']) or []
+            if len(its) < 2:
+                return [None]
+            return its
+
+        def item_mark(its, i):
+            n = i + 1
+            return CIRC[n - 1] if n <= len(CIRC) else f'({n})'
 
         def visible(e):
             if tag_id and tag_id not in [t['id'] for t in tag_all.get(e['id'], [])]:
                 return False
             if qq:
                 hay = ''.join(str(e[k] or '') for k in
-                              ('description', 'check_no', 'party', 'project')).lower()
-                if qq not in hay:
+                              ('description', 'check_no', 'party', 'project'))
+                for it in (items_map.get(e['id']) or []):
+                    hay += str(it['description'] or '') + str(it['party'] or '')
+                if qq not in hay.lower():
                     return False
             return True
 
@@ -1559,7 +1651,8 @@ def export_excel():
         header_row = r
         r += 1
 
-        def write_entry(rr, e, status, bal_formula=None, bal_value=None, is_pending=False):
+        def write_entry(rr, e, status, bal_formula=None, bal_value=None, is_pending=False,
+                        item=None, item_marker=''):
             for c in range(1, ncol + 1):
                 cell = ws.cell(rr, c)
                 cell.font = base_font
@@ -1568,20 +1661,31 @@ def export_excel():
             dc.number_format = 'yyyy-mm-dd'
             dc.alignment = ctr
             ws.cell(rr, C_NO, e['check_no'] or None).alignment = ctr
-            desc = e['description'] or ''
+            if item is not None:
+                # 组合分录的子行：摘要/对方/金额都取明细，父行的项目与备注不下沉
+                desc = item['description'] or e['description'] or ''
+                party = item['party'] or e['party'] or ''
+                debit = item['amount'] if e['debit'] else 0
+                credit = item['amount'] if not e['debit'] else 0
+            else:
+                desc = e['description'] or ''
+                party = e['party'] or ''
+                debit, credit = e['debit'], e['credit']
             if e['project']:
                 desc += ('\n' if desc else '') + '项目：' + e['project']
+            if item_marker:
+                desc = f'{item_marker} {desc}'.strip()
             ws.cell(rr, C_DESC, desc or None).alignment = left_wrap
-            ws.cell(rr, C_PARTY, e['party'] or None).alignment = left_wrap
-            if e['debit']:
-                c4 = ws.cell(rr, C_DEBIT, e['debit'])
+            ws.cell(rr, C_PARTY, party or None).alignment = left_wrap
+            if debit:
+                c4 = ws.cell(rr, C_DEBIT, debit)
                 c4.number_format = money_fmt
-                c4.font = green_font
+                c4.font = green_font if item is None else Font(color='0A7D5A', size=11)
                 c4.alignment = right
-            if e['credit']:
-                c5 = ws.cell(rr, C_CREDIT, e['credit'])
+            if credit:
+                c5 = ws.cell(rr, C_CREDIT, credit)
                 c5.number_format = money_fmt
-                c5.font = red_font
+                c5.font = red_font if item is None else Font(color='C0392B', size=11)
                 c5.alignment = right
             fc = ws.cell(rr, C_BAL)
             if bal_formula is not None:
@@ -1609,7 +1713,7 @@ def export_excel():
                     need = sum(2 if ord(ch) > 127 else 1 for ch in seg)
                     n += max(1, -(-need // cap))
                 return n
-            n_line = max(_lines(desc, 46), _lines(e['party'], 24), _lines(tags, 26))
+            n_line = max(_lines(desc, 46), _lines(party, 24), _lines(tags, 26))
             if n_line > 1:
                 ws.row_dimensions[rr].height = min(17.5 * n_line, 88)
             if is_pending:
@@ -1635,16 +1739,25 @@ def export_excel():
 
         def emit_booked(e):
             nonlocal r, prev_ref, prev_true
-            cur_true = true_bal[e['id']]
-            adj = round(cur_true - prev_true - (e['debit'] - e['credit']), 2)
-            base = prev_ref if prev_ref else f'{round(start_bal, 2)}'
-            formula = (f'={base}+{adj}+{L_DEBIT}{r}-{L_CREDIT}{r}' if abs(adj) > 0.004
-                       else f'={base}+{L_DEBIT}{r}-{L_CREDIT}{r}')
-            write_entry(r, e, '已入账', bal_formula=formula)
-            booked_rows_written.append(r)
-            prev_ref = f'${L_BAL}${r}'
-            prev_true = cur_true
-            r += 1
+            parts = expand(e)
+            n = len(parts)
+            for i, it in enumerate(parts):
+                last = (i == n - 1)
+                base = prev_ref if prev_ref else f'{round(start_bal, 2)}'
+                if last:
+                    cur_true = true_bal[e['id']]
+                    adj = round(cur_true - prev_true - (e['debit'] - e['credit']), 2)
+                    formula = (f'={base}+{adj}+{L_DEBIT}{r}-{L_CREDIT}{r}'
+                               if abs(adj) > 0.004 else f'={base}+{L_DEBIT}{r}-{L_CREDIT}{r}')
+                else:
+                    formula = f'={base}+{L_DEBIT}{r}-{L_CREDIT}{r}'
+                write_entry(r, e, '已入账', bal_formula=formula, item=it,
+                            item_marker=(item_mark(parts, i) if it is not None else ''))
+                booked_rows_written.append(r)
+                prev_ref = f'${L_BAL}${r}'
+                if last:
+                    prev_true = cur_true
+                r += 1
 
         if group_mode:
             months = []
@@ -1654,18 +1767,19 @@ def export_excel():
                     months.append([mo, []])
                 months[-1][1].append(e)
             for mo, lst in months:
+                mo_rows = sum(len(expand(e)) for e in lst)   # 组合分录展开后的实际行数
                 block_row(ws, r, 1, C_DESC, f"📅 {mo}　共 {len(lst)} 笔",
                           fill=month_fill, font=Font(bold=True, color='475569', size=12),
                           align=left_wrap)
                 fill_row(ws, r, C_PARTY, ncol, month_fill)
                 for c, col in ((C_DEBIT, L_DEBIT), (C_CREDIT, L_CREDIT)):
-                    cell = ws.cell(r, c, f'=SUM({col}{r+1}:{col}{r+len(lst)})')
+                    cell = ws.cell(r, c, f'=SUM({col}{r+1}:{col}{r+mo_rows})')
                     cell.number_format = money_fmt
                     cell.font = bold
                     cell.alignment = right
                     cell.border = border
                     cell.fill = month_fill
-                fcell = ws.cell(r, C_BAL, f'={L_BAL}{r+len(lst)}')
+                fcell = ws.cell(r, C_BAL, f'={L_BAL}{r+mo_rows}')
                 fcell.number_format = money_fmt
                 fcell.font = bold
                 fcell.alignment = right
@@ -1712,8 +1826,13 @@ def export_excel():
             ftotal = round(end_true_all, 2)
 
         filter_note = '；已按标签/关键词筛选，实际余额含未显示流水' if (tag_id or qq) else ''
+        combo_n = sum(1 for e in booked if len(expand(e)) > 1)
+        combo_note = ''
+        if combo_n:
+            combo_note = (f'；其中 {combo_n} 笔为组合分录，已按 '
+                          f'{len(booked_rows_written) - (len(booked) - combo_n)} 行明细展开')
         block_row(ws, r, 1, C_DESC,
-                  f"已入账合计　共 {len(booked)} 笔（当前筛选）{filter_note}",
+                  f"已入账合计　共 {len(booked)} 笔（当前筛选）{combo_note}{filter_note}",
                   fill=sum_fill, font=bold_blue, align=left_wrap)
         fill_row(ws, r, C_PARTY, ncol, sum_fill)
         for c, fml, color in ((C_DEBIT, dsum, '0A7D5A'), (C_CREDIT, esum, 'C0392B')):
@@ -1744,8 +1863,11 @@ def export_excel():
         r += 1
         p_first = r
         for e in pend:
-            write_entry(r, e, '未兑现/未到账', is_pending=True)
-            r += 1
+            parts = expand(e)
+            for i, it in enumerate(parts):
+                write_entry(r, e, '未兑现/未到账', is_pending=True, item=it,
+                            item_marker=(item_mark(parts, i) if it is not None else ''))
+                r += 1
         p_last = r - 1
         if not pend:
             block_row(ws, r, 1, ncol, '没有未兑现/未到账的款项',

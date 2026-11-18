@@ -1079,10 +1079,14 @@ def apply_proposal(pid, edits=None, ack=False):
                     continue
                 tags = [r['id'] for r in db.execute(
                     'SELECT tag_id AS id FROM entry_tags WHERE entry_id=?', (eid,))]
+                sub_items = [dict(r) for r in db.execute(
+                    'SELECT * FROM entry_items WHERE entry_id=? ORDER BY seq, id', (eid,))]
                 db.execute('DELETE FROM entry_tags WHERE entry_id=?', (eid,))
+                db.execute('DELETE FROM entry_items WHERE entry_id=?', (eid,))
                 db.execute('DELETE FROM entries WHERE id=?', (eid,))
                 # 附件文件保留在磁盘上，撤销时还能挂回去
-                undo['entries'].append({'row': dict(row), 'tags': tags})
+                undo['entries'].append({'row': dict(row), 'tags': tags,
+                                        'items': sub_items})
                 done.append({'id': eid, 'date': row['date'],
                              'amount': row['debit'] or row['credit'],
                              'direction': 'in' if row['debit'] else 'out'})
@@ -1130,6 +1134,7 @@ def undo_write(wid):
         if undo.get('type') in ('create', 'import'):
             for e in undo.get('entries') or []:
                 db.execute('DELETE FROM entry_tags WHERE entry_id=?', (e['id'],))
+                db.execute('DELETE FROM entry_items WHERE entry_id=?', (e['id'],))
                 db.execute('DELETE FROM entries WHERE id=?', (e['id'],))
                 n += 1
         elif undo.get('type') == 'update':
@@ -1158,6 +1163,15 @@ def undo_write(wid):
                      r.get('debit'), r.get('credit'), r.get('pending'),
                      r.get('project'), r.get('note'), r.get('created_at')))
                 A.set_entry_tags(db, r.get('id'), e.get('tags') or [])
+                # 组合分录的小明细一并还原
+                db.execute('DELETE FROM entry_items WHERE entry_id=?', (r.get('id'),))
+                for it in (e.get('items') or []):
+                    db.execute(
+                        'INSERT INTO entry_items(id,entry_id,seq,description,party,'
+                        'amount,note) VALUES(?,?,?,?,?,?,?)',
+                        (it.get('id'), r.get('id'), it.get('seq') or 0,
+                         it.get('description') or '', it.get('party') or '',
+                         it.get('amount') or 0, it.get('note') or ''))
                 n += 1
         db.commit()
 

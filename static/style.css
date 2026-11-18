@@ -675,3 +675,29 @@ body.agent-open.side-open #main{margin-right:calc(var(--agent-w) + 210px)}
 .tbl .group-row.foldable:hover .co-fold-tip{color:#475569;border-color:#cbd5e1}
 .tbl .group-row.foldable{cursor:pointer}
 .tbl .group-row.foldable .co-fold-tip{float:right;margin-left:10px;font-weight:400}
+
+/* ---------- 组合分录（多笔合记一笔） ---------- */
+/* 日记账里父行上的小徽标：点开看小明细 */
+.item-badge{display:inline-block;margin-left:8px;font-size:11px;font-weight:600;cursor:pointer;
+  color:#1d4ed8;background:#e8effc;border:1px solid #c7d8f7;border-radius:99px;
+  padding:1px 8px;white-space:nowrap}
+.item-badge:hover{background:#dbe7fb;border-color:#a9c4f4}
+/* 展开后的明细子行：缩进 + 淡底，余额列不参与计算 */
+.tbl tbody tr.item-row td{background:#f7faff;font-size:12px;padding:5px 10px;
+  border-bottom:1px dashed #e3ecfa}
+.tbl tbody tr.item-row:hover td{background:#eef5fe}
+.tbl tbody tr.item-row .desc-cell{padding-left:26px;color:#334155}
+.item-seq{display:inline-block;min-width:15px;margin-right:5px;color:#6b8fc7;font-weight:700}
+.tbl tbody tr.combo-row td:nth-child(4){font-weight:600}
+.ctr{text-align:center}
+/* 弹窗里的小明细编辑器 */
+.item-editor{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+.item-line{display:grid;grid-template-columns:26px 1fr 150px 118px 32px;
+  gap:6px;align-items:center}
+.item-line.item-head{font-size:11px;color:var(--muted);font-weight:600}
+.item-line .inp{padding:5px 8px;font-size:12px}
+.item-line .btn.sm{padding:4px 8px;line-height:1}
+@media (max-width:760px){
+  .item-line{grid-template-columns:20px 1fr 100px 32px}
+  .item-line .inp[data-k="party"]{display:none}
+}
