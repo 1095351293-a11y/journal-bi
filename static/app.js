@@ -28,6 +28,19 @@ const S = {
 };
 const accById  = id => S.accounts.find(a=>a.id===id);
 let jrGroupMonth = false;
+/* 日记账两段（已入账 / 未兑现）的收起状态：收起只藏明细，段头与小计仍可见 */
+let jrFold = { booked:false, pend:false };
+/* 「全部公司」：S.company 为字符串 'all'，其余情况仍是公司 id 数字 */
+const isAllCo  = () => S.company === 'all';
+const coAccs   = () => isAllCo() ? S.accounts : S.accounts.filter(a=>a.company_id===S.company);
+const coName   = () => isAllCo() ? '全部公司' : (compById(S.company)?.name || '');
+const coParam  = () => isAllCo() ? '' : ('company_id=' + S.company);
+/* 日记账账户选择器：面板开合 + 按公司收起的分组 */
+let jrPickOpen = false;
+let jrCollapsedCo = new Set();
+/* 现金 / 定期 页「全部公司」下按公司收起的分组 */
+let cashFoldCo = new Set();
+let depFoldCo  = new Set();
 const compById = id => S.companies.find(c=>c.id===id);
 const rateOf   = cur => S.rates[cur] ?? 1;
 const accRate  = a  => rateOf(a.currency);
@@ -63,10 +76,20 @@ function viewStateSave(){
       q:j.q, status:j.status, tagId:j.tagId}));
   }catch(e){}
 }
+/* 侧栏「当前公司」下拉：第一项是全部公司 */
+function paintCompanySelect(){
+  const sel = $('#companySelect');
+  if(!sel) return;
+  sel.innerHTML = `<option value="all" ${isAllCo()?'selected':''}>🌐 全部公司（${S.companies.length}）</option>`
+    + (S.companies.map(c=>`<option value="${c.id}" ${c.id===S.company?'selected':''}>${esc(c.name)}</option>`).join('')
+       || '<option value="">（请先在"公司与账户"新建公司）</option>');
+}
 function viewStateRestore(){
   try{
-    const cid = +(localStorage.getItem(CO_KEY) || 0);
-    if(cid && S.companies.some(c=>c.id===cid)) S.company = cid;
+    const raw = localStorage.getItem(CO_KEY);
+    if(raw === 'all') S.company = 'all';
+    else if(raw){ const cid = +raw; if(cid && S.companies.some(c=>c.id===cid)) S.company = cid; }
+    paintCompanySelect();     // bootstrap 已先把下拉画成默认公司，这里按记忆改回来
   }catch(e){}
   try{
     const j = JSON.parse(sessionStorage.getItem(JR_KEY) || 'null');
@@ -132,7 +155,7 @@ function reminderGroups(list){
   const cMap = new Map();
   for(const r of list){
     const cid = r.company_id;
-    if(!cMap.has(cid)) cMap.set(cid, {company:r.company_name, items:[]});
+    if(!cMap.has(cid)) cMap.set(cid, {cid, company:r.company_name, items:[]});
     cMap.get(cid).items.push(r);
   }
   return [...cMap.values()].map(c=>{
@@ -140,16 +163,33 @@ function reminderGroups(list){
     for(const r of c.items){
       const tag = (r.tags||[])[0];
       const key = tag ? 't'+tag.id : 'note';
-      if(!tMap.has(key)) tMap.set(key, {tag, items:[]});
+      if(!tMap.has(key)) tMap.set(key, {key, tag, items:[]});
       tMap.get(key).items.push(r);
     }
-    return {company:c.company, items:c.items,
+    return {cid:c.cid, company:c.company, items:c.items,
       groups:[...tMap.values()].sort((a,b)=>
         b.items.length-a.items.length ||
         (a.tag?.name||'').localeCompare(b.tag?.name||'', 'zh'))};
   }).sort((a,b)=>
     b.items.length-a.items.length ||
     (a.company||'').localeCompare(b.company||'', 'zh'));
+}
+/* 收起状态：公司级 coSet、标签组级 grpSet，本次会话内记住 */
+const remFold = { co:new Set(), grp:new Set() };
+const remCoKey  = c => 'c'+c.cid;
+const remGrpKey = (c, g) => 'g'+c.cid+'|'+g.key;
+function remGroupAmt(items){
+  // 收起时也能看到这一组的大概金额（同币种合并展示，多币种只显示笔数）
+  const byCur = new Map();
+  for(const r of items){
+    const cur = r.currency || '';
+    byCur.set(cur, (byCur.get(cur)||0) + (+(r.debit || r.credit) || 0));
+  }
+  if(byCur.size === 1){
+    const [cur, v] = [...byCur.entries()][0];
+    return `${cur} ${fmt(v)}`;
+  }
+  return '';
 }
 function reminderModalHTML(list){
   if(!list.length){
@@ -158,19 +198,45 @@ function reminderModalHTML(list){
       <div class="modal-actions"><button class="btn" data-action="modal-close">关闭</button></div>`;
   }
   return modalHead(`🔔 待办提醒（${list.length} 笔）`)+`
-    <div class="hint mb">先按公司、再按标签分类；带备注但无标签的归入“备注提醒”。点任意一笔的文字即可看详情、改标签和备注。</div>
+    <div class="rem-topline">
+      <div class="hint">先按公司、再按标签分类；带备注但无标签的归入“备注提醒”。点公司或标签行的标题即可收起／展开；点任意一笔的文字看详情、改标签和备注。</div>
+      <div class="rem-topbtns">
+        <button class="btn sm" data-action="rem-fold-all" data-fold="1">全部收起</button>
+        <button class="btn sm" data-action="rem-fold-all" data-fold="0">全部展开</button>
+      </div>
+    </div>
     <div id="remListTip" class="rem-tip" style="display:none"></div>
     <div id="remList" style="max-height:62vh;overflow:auto">
-    ${reminderGroups(list).map(c=>`
-      <div class="rem-company">
-        <div class="rem-company-head">🏢 ${esc(c.company)}<span class="muted small">${c.items.length} 笔</span></div>
-        ${c.groups.map(g=>`
-          <div class="rem-group">
-            <div class="rem-group-head">
+    ${reminderGroups(list).map(c=>{
+      const ck = remCoKey(c), cf = remFold.co.has(ck);
+      const sums = remGroupAmt(c.items);
+      return `
+      <div class="rem-company${cf?' folded':''}">
+        <div class="rem-company-head${cf?' folded':''}" data-action="rem-fold-co" data-key="${ck}"
+             title="${cf?'点击展开这家公司':'点击收起这家公司'}">
+          <span class="fold-caret">${cf?'▸':'▾'}</span>
+          <span class="rem-co-name">🏢 ${esc(c.company)}</span>
+          <span class="muted small">${c.items.length} 笔</span>
+          ${sums?`<span class="muted small">· ${sums}</span>`:''}
+          <span class="muted small">· ${c.groups.length} 类</span>
+          <span class="rem-fold-tip">${cf?'展开':'收起'}</span>
+        </div>
+        <div class="rem-co-body" style="${cf?'display:none':''}">
+        ${c.groups.map(g=>{
+          const gk = remGrpKey(c, g), gf = remFold.grp.has(gk);
+          const gsum = remGroupAmt(g.items);
+          return `
+          <div class="rem-group${gf?' folded':''}">
+            <div class="rem-group-head${gf?' folded':''}" data-action="rem-fold-grp" data-key="${gk}"
+                 title="${gf?'点击展开这一组':'点击收起这一组'}">
+              <span class="fold-caret">${gf?'▸':'▾'}</span>
               ${g.tag?`<span class="tagchip" style="background:${g.tag.color}">${esc(g.tag.name)}</span>`
                      :'<span class="tagchip" style="background:#f59e0b">📝 备注提醒</span>'}
               <span class="muted small">${g.items.length} 笔</span>
+              ${gsum?`<span class="muted small">· ${gsum}</span>`:''}
+              <span class="rem-fold-tip">${gf?'展开':'收起'}</span>
             </div>
+            <div class="rem-grp-body" style="${gf?'display:none':''}">
             ${g.items.map(r=>`
               <div class="note-remind-item" data-rid="${r.id}">
                 <div class="nr-info" data-action="note-detail" data-id="${r.id}"
@@ -188,10 +254,27 @@ function reminderModalHTML(list){
                 <label class="small" title="确认后将清空该笔的备注和标签" style="display:flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap">
                   <input type="checkbox" data-change="note-dismiss" data-id="${r.id}" style="width:15px;height:15px">不再提示</label>
               </div>`).join('')}
-          </div>`).join('')}
-      </div>`).join('')}
+            </div>
+          </div>`;
+        }).join('')}
+        </div>
+      </div>`;
+    }).join('')}
     </div>
     <div class="modal-actions"><button class="btn" data-action="modal-close">关闭</button></div>`;
+}
+/* 不重绘、就地切换一组的收起状态（保住滚动位置） */
+function applyRemFold(head, folded){
+  head.classList.toggle('folded', folded);
+  const caret = head.querySelector('.fold-caret');
+  if(caret) caret.textContent = folded ? '▸' : '▾';
+  const tip = head.querySelector('.rem-fold-tip');
+  if(tip) tip.textContent = folded ? '展开' : '收起';
+  const body = head.nextElementSibling;
+  if(body) body.style.display = folded ? 'none' : '';
+  const wrap = head.closest('.rem-group') || head.closest('.rem-company');
+  if(wrap) wrap.classList.toggle('folded', folded);
+  head.title = folded ? '点击展开' : '点击收起';
 }
 /* 详情弹窗里的标签选择器（点一下切换选中） */
 function remTagChipsHTML(sel){
@@ -360,10 +443,8 @@ async function refreshBootstrap(){
   S.rates=b.rates; S.today=b.today; S.range=b.entry_range||null;
   S.depCounts=b.dep_counts||{};
   S.depAlerts = b.dep_alerts || {due:0, soon:0};
-  if(!S.companies.find(c=>c.id===S.company)) S.company=S.companies[0]?.id ?? null;
-  const sel=$('#companySelect');
-  sel.innerHTML = S.companies.map(c=>`<option value="${c.id}" ${c.id===S.company?'selected':''}>${esc(c.name)}</option>`).join('')
-    || '<option value="">（请先在"公司与账户"新建公司）</option>';
+  if(S.company !== 'all' && !S.companies.find(c=>c.id===S.company)) S.company=S.companies[0]?.id ?? null;
+  paintCompanySelect();
   renderDepBadge();
 }
 /* 侧栏"定期存款"到期数量角标 */
@@ -380,11 +461,23 @@ function renderDepBadge(){
 }
 function bindStatic(){
   $('#companySelect').addEventListener('change', e=>{
-    S.company = Number(e.target.value)||null;
-    if(S.view==='journal' && accById(S.jr.accId)?.company_id!==S.company){
+    const v = e.target.value;
+    const all = (v === 'all');
+    S.company = all ? 'all' : (Number(v)||null);
+    jrPickOpen = false;
+    // 切到具体公司且当前账户不属于它 → 重置到该公司的第一个账户；切到「全部」则保留当前账户
+    if(!all && S.view==='journal' && accById(S.jr.accId)?.company_id !== S.company){
       S.jr = {accId:null,account:null,entries:[],loaded:false,from:'',to:'',preset:'thisMonth',q:'',status:'',tagId:''};
     }
     switchView(S.view);
+  });
+  // 点面板外收起账户选择器
+  document.addEventListener('click', e=>{
+    if(!jrPickOpen) return;
+    if(!document.contains(e.target)) return;   // 面板刚被重绘，忽略这次冒泡
+    if(e.target.closest('#jrAccPick')) return;
+    jrPickOpen = false;
+    paintJrPick();
   });
   $('#globalSearch').addEventListener('keydown', e=>{
     if(e.key==='Enter' && e.target.value.trim()) globalSearch(e.target.value.trim());
@@ -408,7 +501,7 @@ function badge(entry){
 async function renderDashboard(){
   const c = $('#content');
   if(!S.company){ c.innerHTML = '<div class="card empty-hint">请先在"公司与账户"中新建公司</div>'; return; }
-  const d = await api('/api/dashboard?company_id='+S.company);
+  const d = await api('/api/dashboard' + (isAllCo() ? '' : '?company_id=' + S.company));
   const comp = compById(S.company);
   const rate = a => accRate(a);
   const cashAccs  = d.accounts.filter(a=>(a.kind||'bank')==='cash');
@@ -443,6 +536,41 @@ async function renderDashboard(){
                     .filter(x=>x.st.level>0).sort((a,b)=>a.st.left-b.st.left);
   const nextDue = d.deposits.map(x=>({...x, st:depStatus(x)}))
                   .filter(x=>x.st.level===0 && x.st.left>=0).sort((a,b)=>a.st.left-b.st.left)[0];
+
+  const accCard = a => {
+    const isCash = (a.kind||'bank')==='cash';
+    return `
+      <div class="card">
+        <div class="row spread">
+          <b>${isCash?'💵 ':''}${esc(a.name)}</b><span class="cur-chip">${esc(a.currency)}</span>
+        </div>
+        <div class="small muted" style="margin:3px 0 8px">${esc(a.bank)} ${esc(a.account_no)}</div>
+        <div style="font-size:21px;font-weight:700" class="num ${isCash?'':'green'}">${fmt(a.bank)}</div>
+        <div class="small muted num">${isCash?'账面余额':'银行余额（实际）'}</div>
+        <div class="small mt">
+          ${a.pending_credit>0?`未兑现支票<b class="num amber" style="float:right">－${fmt(a.pending_credit)}</b><br>`:''}
+          ${a.pending_debit>0?`未到账收入<b class="num green" style="float:right">＋${fmt(a.pending_debit)}</b><br>`:''}
+          ${(a.pending_credit>0||a.pending_debit>0)?`预计余额（本币）<b class="num" style="float:right">${fmt(a.book)}</b><br>`:''}
+          折 MOP<b class="num" style="float:right">${fmtI(a.book*rate(a))}</b>
+        </div>
+        <div class="row mt" style="gap:8px">
+          <button class="btn sm" data-action="goto-journal" data-id="${a.id}">查看流水</button>
+          ${isCash
+            ? `<button class="btn sm" data-action="cash-add" data-cur="${esc(a.currency)}"${isAllCo()?' disabled title="请先选择具体公司"':''}>盘点</button>`
+            : `<button class="btn sm" data-action="planner" data-id="${a.id}">资金规划</button>`}
+        </div>
+      </div>`;
+  };
+  const cardsHTML = isAllCo()
+    ? (S.companies.map(cp=>{
+        const list = d.accounts.filter(a=>a.company_id===cp.id);
+        if(!list.length) return '';
+        const sub = list.reduce((s,a)=>s+a.book*rate(a),0);
+        return `<div class="co-group-head">🏢 ${esc(cp.name)}
+            <span class="hint">${list.length} 个账户　折 MOP ${fmtI(sub)}</span></div>
+          <div class="grid-cards">${list.map(accCard).join('')}</div>`;
+      }).join('') || '<div class="card empty-hint">还没有账户</div>')
+    : `<div class="grid-cards">${d.accounts.map(accCard).join('') || '<div class="card empty-hint">该公司还没有账户，去"公司与账户"添加</div>'}</div>`;
 
   c.innerHTML = `
   <div class="kpis">
@@ -485,32 +613,8 @@ async function renderDashboard(){
     </div>`).join('')}
     </div></div>`:''}
 
-  <div class="section-title">🏦 ${esc(comp?.name||'')} · 账户余额</div>
-  <div class="grid-cards">
-    ${d.accounts.map(a=>{
-      const isCash = (a.kind||'bank')==='cash';
-      return `
-      <div class="card">
-        <div class="row spread">
-          <b>${isCash?'💵 ':''}${esc(a.name)}</b><span class="cur-chip">${esc(a.currency)}</span>
-        </div>
-        <div class="small muted" style="margin:3px 0 8px">${esc(a.bank)} ${esc(a.account_no)}</div>
-        <div style="font-size:21px;font-weight:700" class="num ${isCash?'':'green'}">${fmt(a.bank)}</div>
-        <div class="small muted num">${isCash?'账面余额':'银行余额（实际）'}</div>
-        <div class="small mt">
-          ${a.pending_credit>0?`未兑现支票<b class="num amber" style="float:right">－${fmt(a.pending_credit)}</b><br>`:''}
-          ${a.pending_debit>0?`未到账收入<b class="num green" style="float:right">＋${fmt(a.pending_debit)}</b><br>`:''}
-          ${(a.pending_credit>0||a.pending_debit>0)?`预计余额（本币）<b class="num" style="float:right">${fmt(a.book)}</b><br>`:''}
-          折 MOP<b class="num" style="float:right">${fmtI(a.book*rate(a))}</b>
-        </div>
-        <div class="row mt" style="gap:8px">
-          <button class="btn sm" data-action="goto-journal" data-id="${a.id}">查看流水</button>
-          ${isCash
-            ? `<button class="btn sm" data-action="cash-add" data-cur="${esc(a.currency)}">盘点</button>`
-            : `<button class="btn sm" data-action="planner" data-id="${a.id}">资金规划</button>`}
-        </div>
-      </div>`;}).join('') || '<div class="card empty-hint">该公司还没有账户，去"公司与账户"添加</div>'}
-  </div>
+  <div class="section-title">🏦 ${esc(isAllCo()?'全部公司':(comp?.name||''))} · 账户余额</div>
+  ${cardsHTML}
 
   <div class="section-title">📈 近 ${mrows.length} 个月收支（折 MOP）</div>
   <div class="card">${barChart(mrows)}
@@ -566,14 +670,45 @@ const CUR_LABEL = {MOP:'澳门币 MOP', HKD:'港币 HKD', CNY:'人民币 CNY'};
 let cashDate = '';            // 余额／新建盘点的默认日期
 const ccNum = v => { const n = parseFloat(v); return isFinite(n) ? n : 0; };
 
+/* 按公司分组：表格行按 data-co 隐藏 / 卡片区隐藏后一块 */
+/* 日记账分段收起：只切明细行的 display，不重绘（滚动位置不丢） */
+function toggleJrSec(sec){
+  const folded = !!jrFold[sec];
+  // 段头由下面的 group-row 分支单独处理，这里只藏明细（含按月分组头、空态行）
+  $$(`#jrTable tr[data-sec="${sec}"]:not(.group-row)`).forEach(tr=>{ tr.style.display = folded ? 'none' : ''; });
+  $$(`#jrTable tr.group-row[data-sec="${sec}"]`).forEach(head=>{
+    head.classList.toggle('folded', folded);
+    const caret = head.querySelector('.fold-caret');
+    if(caret) caret.textContent = folded ? '▸' : '▾';
+    const tip = head.querySelector('.co-fold-tip');
+    if(tip) tip.textContent = folded ? '展开' : '收起';
+  });
+}
+
+function toggleCoFold(head, folded, coId){
+  head.classList.toggle('folded', folded);
+  const caret = head.querySelector('.fold-caret');
+  if(caret) caret.textContent = folded ? '▸' : '▾';
+  const tip = head.querySelector('.co-fold-tip');
+  if(tip) tip.textContent = folded ? '展开' : '收起';
+  if(head.tagName === 'TR'){
+    document.querySelectorAll(`tr[data-co="${coId}"]`).forEach(tr=>{
+      tr.style.display = folded ? 'none' : '';
+    });
+  }else if(head.nextElementSibling){
+    head.nextElementSibling.style.display = folded ? 'none' : '';
+  }
+}
+
 async function renderCash(){
   const c = $('#content');
   if(!S.company){ c.innerHTML = '<div class="card empty-hint">请先在"公司与账户"中新建公司</div>'; return; }
   if(!cashDate) cashDate = S.today;
-  const cashAccs = S.accounts.filter(a=>a.company_id===S.company && a.kind==='cash');
+  const allCo = isAllCo();
+  const cashAccs = coAccs().filter(a=>a.kind==='cash');
   const [book, counts] = await Promise.all([
-    api(`/api/cash/book?company_id=${S.company}&date=${cashDate}`),
-    api(`/api/cash/counts?company_id=${S.company}`),
+    api(`/api/cash/book?${coParam()}&date=${cashDate}`),
+    api(`/api/cash/counts?${coParam()}`),
   ]);
   const books = book.accounts || [];
   const totalMop = books.reduce((s,a)=>s + a.book*rateOf(a.currency), 0);
@@ -585,13 +720,15 @@ async function renderCash(){
     <label class="hint" style="display:flex;align-items:center;gap:6px">余额截至
       <input type="date" id="cashDate" class="inp" data-change="cash-date" value="${esc(cashDate)}" style="width:140px"></label>
     <span class="sep"></span>
-    <button class="btn primary" data-action="cash-add">＋ 新建盘点</button>
-    <button class="btn" data-action="cash-export">📥 导出Excel</button>
+    <button class="btn primary" data-action="cash-add"${allCo?' disabled title="盘点单要归属到某个公司，请先选择具体公司"':''}>＋ 新建盘点</button>
+    ${allCo
+      ? `<span class="btn" style="opacity:.45;cursor:not-allowed" title="导出盘点表需要指定公司">📥 导出Excel</span>`
+      : `<button class="btn" data-action="cash-export">📥 导出Excel</button>`}
     <button class="btn" data-action="cash-goto-journal">📖 现金流水</button>
     <span class="hint">盘点按面额录入张数，系统自动算实有金额与差异；每行「复制」可照上一张单快速新建</span>
   </div>
 
-  ${!cashAccs.length ? `<div class="card empty-hint">该公司还没有库存现金账户。去「公司与账户」新增账户，类型选<b>现金</b>（建议按币种各建一个）。</div>` : ''}
+  ${!cashAccs.length ? `<div class="card empty-hint">${allCo?'':'该公司'}还没有库存现金账户。去「公司与账户」新增账户，类型选<b>现金</b>（建议按币种各建一个）。</div>` : ''}
 
   <div class="kpis">
     <div class="kpi"><div class="k-label">库存现金（折 MOP）</div>
@@ -606,20 +743,21 @@ async function renderCash(){
   </div>
 
   <div class="section-title">💵 现金账户余额（截至 ${esc(cashDate||'—')}）</div>
-  <div class="grid-cards">
-    ${books.map(a=>`
-      <div class="card">
-        <div class="row spread"><b>${esc(a.name)}</b><span class="cur-chip">${esc(a.currency)}</span></div>
-        <div class="small muted" style="margin:3px 0 8px">现金库　　期初 ${esc(a.opening_date||'—')} ${fmt(a.opening)}</div>
-        <div style="font-size:21px;font-weight:700" class="num">${fmt(a.book)}</div>
-        <div class="small muted num">账面余额　流水 ${a.entry_count} 笔</div>
-        <div class="small mt">折 MOP<b class="num" style="float:right">${fmtI(a.book*rateOf(a.currency))}</b></div>
-        <div class="row mt" style="gap:8px">
-          <button class="btn sm" data-action="cash-acc-journal" data-id="${a.id}">查看流水</button>
-          <button class="btn sm" data-action="cash-add" data-cur="${esc(a.currency)}">盘点</button>
-        </div>
-      </div>`).join('') || '<div class="card empty-hint">暂无现金账户</div>'}
-  </div>
+  ${allCo
+    ? (S.companies.map(cp=>{
+        const list = books.filter(a=>a.company_id===cp.id);
+        if(!list.length) return '';
+        const folded = cashFoldCo.has(cp.id);
+        const sub = list.reduce((s,a)=>s+a.book*rateOf(a.currency),0);
+        return `<div class="co-group-head foldable${folded?' folded':''}" data-action="cash-fold-co" data-key="${cp.id}">
+            <span class="fold-caret">${folded?'▸':'▾'}</span>
+            <span>🏢 ${esc(cp.name)}</span>
+            <span class="hint">${list.length} 个现金账户　折 MOP ${fmtI(sub)}</span>
+            <span class="co-fold-tip">${folded?'展开':'收起'}</span>
+          </div>
+          <div class="grid-cards co-body" style="${folded?'display:none':''}">${list.map(cashCard).join('')}</div>`;
+      }).join('') || '<div class="card empty-hint">暂无现金账户</div>')
+    : `<div class="grid-cards">${books.map(cashCard).join('') || '<div class="card empty-hint">暂无现金账户</div>'}</div>`}
 
   <div class="section-title">📋 现金盘点记录（${counts.length} 张）</div>
   <div class="card" style="padding:0">
@@ -627,26 +765,59 @@ async function renderCash(){
       <th>盘点日期</th><th>币种</th><th class="num">账面应有</th><th class="num">盘点实有</th>
       <th class="num">差异</th><th class="num">白条抵库</th><th>盘点人</th><th>监盘人</th><th></th>
     </tr></thead><tbody>
-    ${counts.map(x=>{
-      const d = x.diff_total;
-      return `<tr data-action="cash-edit" data-id="${x.id}" style="cursor:pointer">
-        <td style="white-space:nowrap"><b>${esc(x.count_date)}</b>${x.count_date===cashDate?' <span class="cur-chip">当日在看</span>':''}</td>
-        <td>${x.items.map(i=>`<span class="cur-chip">${esc(i.currency)}</span>`).join(' ')}</td>
-        <td class="num">${fmt(x.book_total)}</td>
-        <td class="num">${fmt(x.actual_total)}</td>
-        <td class="num ${Math.abs(d)>0.005?(d>0?'green':'red'):''}" style="font-weight:${Math.abs(d)>0.005?700:400}">${d>0.005?'+':''}${fmt(d)}</td>
-        <td class="num">${x.white_total?fmt(x.white_total):'—'}</td>
-        <td>${esc(x.person||'—')}</td>
-        <td>${esc(x.supervisor||'—')}</td>
-        <td style="white-space:nowrap">
-          <button class="btn sm" data-action="cash-edit" data-id="${x.id}">查看/编辑</button>
-          <button class="btn sm" data-action="cash-copy" data-id="${x.id}" title="按这张单的币种、面额张数、人员新建一张">复制</button>
-          <button class="btn sm danger" data-action="cash-del" data-id="${x.id}">删除</button>
-        </td></tr>`;
-    }).join('') || '<tr><td colspan="9" class="empty-hint">还没有盘点记录，点右上角「＋ 新建盘点」按面额录入</td></tr>'}
+    ${(allCo
+      ? (S.companies.map(cp=>{
+          const list = counts.filter(x=>x.company_id===cp.id);
+          if(!list.length) return '';
+          const folded = cashFoldCo.has(cp.id);
+          const curs = [...new Set(list.flatMap(x=>x.items.map(i=>i.currency)))];
+          const diffN = list.filter(x=>Math.abs(x.diff_total)>0.005).length;
+          return `<tr class="group-row foldable${folded?' folded':''}" data-action="cash-fold-co" data-key="${cp.id}" style="cursor:pointer">
+              <td colspan="9"><span class="fold-caret">${folded?'▸':'▾'}</span>🏢 ${esc(cp.name)}
+                <span class="hint">${list.length} 张　${curs.map(c=>esc(c)).join(' · ')}${diffN?`　${diffN} 张有差异`:''}</span>
+                <span class="co-fold-tip">${folded?'展开':'收起'}</span></td></tr>`
+            + list.map(x=>ccRow(x, cp.id)).join('');
+        }).join('') || `<tr><td colspan="9" class="empty-hint">还没有盘点记录，点右上角「＋ 新建盘点」按面额录入</td></tr>`)
+      : (counts.map(ccRow).join('') || `<tr><td colspan="9" class="empty-hint">还没有盘点记录，点右上角「＋ 新建盘点」按面额录入</td></tr>`))}
     </tbody></table>
   </div>
-  <div class="hint mt">盘点口径：账面应有 = 上一日账面库存 ＋ 未记账传票收入 － 未记账传票付出；盘点实有 = 各面额张数合计；差异 = 实有 － 账面应有（另列白条抵库）。金额为折 MOP 汇总。</div>`;
+  <div class="hint mt">盘点口径：账面应有 = 上一日账面库存 ＋ 未记账传票收入 － 未记账传票付出；盘点实有 = 各面额张数合计；差异 = 实有 － 账面应有（另列白条抵库）。金额为折 MOP 汇总。${allCo?'　按公司分组，点公司行可收起。':''}</div>`;
+}
+
+/* 现金账户卡片 */
+function cashCard(a){
+  return `
+  <div class="card">
+    <div class="row spread"><b>${esc(a.name)}</b><span class="cur-chip">${esc(a.currency)}</span></div>
+    <div class="small muted" style="margin:3px 0 8px">现金库　　期初 ${esc(a.opening_date||'—')} ${fmt(a.opening)}</div>
+    <div style="font-size:21px;font-weight:700" class="num">${fmt(a.book)}</div>
+    <div class="small muted num">账面余额　流水 ${a.entry_count} 笔</div>
+    <div class="small mt">折 MOP<b class="num" style="float:right">${fmtI(a.book*rateOf(a.currency))}</b></div>
+    <div class="row mt" style="gap:8px">
+      <button class="btn sm" data-action="cash-acc-journal" data-id="${a.id}">查看流水</button>
+      <button class="btn sm" data-action="cash-add" data-cur="${esc(a.currency)}"${isAllCo()?' disabled title="请先选择具体公司"':''}>盘点</button>
+    </div>
+  </div>`;
+}
+
+/* 盘点记录一行 */
+function ccRow(x, coId){
+  const d = x.diff_total;
+  const coTip = '';
+  return `<tr data-action="cash-edit" data-id="${x.id}" style="cursor:pointer"${coId?` data-co="${coId}"`:''}>
+    <td style="white-space:nowrap"><b>${esc(x.count_date)}</b>${x.count_date===cashDate?' <span class="cur-chip">当日在看</span>':''}${coTip}</td>
+    <td>${x.items.map(i=>`<span class="cur-chip">${esc(i.currency)}</span>`).join(' ')}</td>
+    <td class="num">${fmt(x.book_total)}</td>
+    <td class="num">${fmt(x.actual_total)}</td>
+    <td class="num ${Math.abs(d)>0.005?(d>0?'green':'red'):''}" style="font-weight:${Math.abs(d)>0.005?700:400}">${d>0.005?'+':''}${fmt(d)}</td>
+    <td class="num">${x.white_total?fmt(x.white_total):'—'}</td>
+    <td>${esc(x.person||'—')}</td>
+    <td>${esc(x.supervisor||'—')}</td>
+    <td style="white-space:nowrap">
+      <button class="btn sm" data-action="cash-edit" data-id="${x.id}">查看/编辑</button>
+      <button class="btn sm" data-action="cash-copy" data-id="${x.id}" title="按这张单的币种、面额张数、人员新建一张">复制</button>
+      <button class="btn sm danger" data-action="cash-del" data-id="${x.id}">删除</button>
+    </td></tr>`;
 }
 
 function cashBlockHTML(it){
@@ -678,24 +849,28 @@ async function openCashCount(id, copyId){
   let head = {count_date:cashDate||S.today, person:'', supervisor:'', note:''};
   let items = [];
   let src = null;                       // 复制来源单
+  // 「全部公司」下也有把手的单据：一律用单据自己的公司，绝不能写成 'all'
+  let coId = isAllCo() ? null : S.company;
   if(id){
     const d = await api('/api/cash/counts/'+id);
     head = d.count; items = d.items || [];
+    coId = d.count.company_id ?? coId;
   }else if(copyId){
     // 复制以新增：带上原单的币种、面额张数、差异原因、人员；日期改今天，账面数按新日期重算
     const d = await api('/api/cash/counts/'+copyId);
     src = d.count;
+    coId = d.count.company_id ?? coId;
     head = {count_date:S.today, person:d.count.person || '',
             supervisor:d.count.supervisor || '', note:''};
     items = (d.items || []).map(it=>({...it}));
-    const b = await api(`/api/cash/book?company_id=${S.company}&date=${head.count_date}`);
+    const b = await api(`/api/cash/book?company_id=${coId}&date=${head.count_date}`);
     const bookMap = {};
     (b.accounts||[]).forEach(a=>{ bookMap[a.currency] = a.book; });
     items.forEach(it=>{
       if(bookMap[it.currency] !== undefined) it.prev_book = bookMap[it.currency];
     });
   }else{
-    const b = await api(`/api/cash/book?company_id=${S.company}&date=${head.count_date}`);
+    const b = await api(`/api/cash/book?company_id=${coId}&date=${head.count_date}`);
     items = (b.accounts||[]).map(a=>({currency:a.currency, prev_book:a.book,
       unposted_in:0, unposted_out:0, white:0, reason:'', denoms:[]}));
   }
@@ -742,7 +917,7 @@ async function openCashCount(id, copyId){
       const d = dateInp.value;
       if(!d) return;
       try{
-        const b = await api(`/api/cash/book?company_id=${S.company}&date=${d}`);
+        const b = await api(`/api/cash/book?company_id=${coId}&date=${d}`);
         const bookMap = {};
         (b.accounts||[]).forEach(a=>{ bookMap[a.currency] = a.book; });
         $$('#ccForm .cc-block').forEach(blk=>{
@@ -759,7 +934,7 @@ async function openCashCount(id, copyId){
     ev.preventDefault();
     const f = new FormData(ev.target);
     const body = {
-      company_id: S.company,
+      company_id: coId,
       count_date: f.get('count_date'),
       person: f.get('person') || '',
       supervisor: f.get('supervisor') || '',
@@ -853,6 +1028,57 @@ function ccRecalc(){
 /* ================================================================
    日记账
 ================================================================ */
+/* 日记账顶部的账户选择器：全部公司时按公司分组、可逐组收起 */
+function apickItem(a){
+  const on = a.id === S.jr.accId;
+  return `<button type="button" class="apick-it${on?' on':''}" data-action="apick-pick" data-id="${a.id}">
+      <span class="apick-it-ico">${a.kind==='cash'?'💵':'🏦'}</span>
+      <span class="apick-it-nm">${esc(a.name)}</span>
+      <span class="apick-it-cur">${esc(a.currency)}</span>
+      ${on?'<span class="apick-tick">✓</span>':''}
+    </button>`;
+}
+function jrPickHTML(){
+  const accs = coAccs();
+  const cur = accById(S.jr.accId);
+  const curCo = cur ? (compById(cur.company_id)?.name || '') : '';
+  const head = `<button type="button" class="apick-btn" data-action="apick-toggle"
+      title="${cur?esc((isAllCo()?curCo+' · ':'')+cur.name+'（'+cur.currency+'）'):'选择账户'}">
+      <span class="apick-ico">${cur && cur.kind==='cash' ? '💵' : '🏦'}</span>
+      <span class="apick-txt">
+        ${isAllCo() && curCo ? `<span class="apick-co">${esc(curCo)}</span>` : ''}
+        <span class="apick-nm">${cur ? esc(cur.name)+'（'+esc(cur.currency)+'）' : '选择账户'}</span>
+      </span>
+      <span class="apick-arw">▾</span>
+    </button>`;
+  let body;
+  if(!isAllCo()){
+    body = accs.map(apickItem).join('') || '<div class="apick-empty">该公司还没有账户</div>';
+  }else{
+    body = S.companies.map(cp=>{
+      const list = S.accounts.filter(a=>a.company_id===cp.id);
+      if(!list.length) return '';
+      const col = jrCollapsedCo.has(cp.id);
+      return `<div class="apick-grp" data-co="${cp.id}">
+        <button type="button" class="apick-gh${col?' col':''}" data-action="apick-co" data-co="${cp.id}">
+          <span class="apick-chv">${col?'▸':'▾'}</span>
+          <span class="apick-gname">${esc(cp.name)}</span>
+          <span class="apick-cnt">${list.length}</span>
+        </button>
+        ${col ? '' : `<div class="apick-items">${list.map(apickItem).join('')}</div>`}
+      </div>`;
+    }).join('') || '<div class="apick-empty">还没有账户</div>';
+  }
+  return `<div class="apick" id="jrAccPick">
+    ${head}
+    <div class="apick-panel${jrPickOpen?'':' hidden'}">${body}</div>
+  </div>`;
+}
+function paintJrPick(){
+  const box = $('#jrAccPick');
+  if(box) box.outerHTML = jrPickHTML();
+}
+
 async function renderJournal(){
   const c = $('#content');
   if(!S.company){ c.innerHTML='<div class="card empty-hint">请先新建公司</div>'; return; }
@@ -860,10 +1086,10 @@ async function renderJournal(){
   if(S.jr.preset==='thisMonth' && !S.jr.from && !S.jr.to){
     [S.jr.from, S.jr.to] = presetRange('thisMonth');
   }
-  const coAccs = S.accounts.filter(a=>a.company_id===S.company);
-  if(!S.jr.accId || !coAccs.find(a=>a.id===S.jr.accId)){
-    if(!coAccs.length){ c.innerHTML='<div class="card empty-hint">该公司还没有账户，去"公司与账户"添加</div>'; return; }
-    S.jr.accId = coAccs[0].id;
+  const accs = coAccs();
+  if(!S.jr.accId || !accs.find(a=>a.id===S.jr.accId)){
+    if(!accs.length){ c.innerHTML='<div class="card empty-hint">该公司还没有账户，去"公司与账户"添加</div>'; return; }
+    S.jr.accId = accs[0].id;
     S.jr.loaded = false;
   }
   if(!S.jr.loaded){
@@ -889,7 +1115,15 @@ async function renderJournal(){
     return true;
   });
   const bookedRows = rows.filter(e=>!e.pending);
-  const pendRows   = rows.filter(e=>e.pending);
+  // 未兑现/未到账：不看日期范围，该账户所有月份的待兑付都要露出来
+  // （标签、搜索仍然生效，方便定位某一类）
+  const pendRows = S.jr.entries.filter(e=>{
+    if(!e.pending) return false;
+    if(S.jr.tagId && !e.tags.find(t=>t.id===+S.jr.tagId)) return false;
+    if(q && !((e.description||'')+(e.check_no||'')+(e.party||'')+(e.project||'')).toLowerCase().includes(q)) return false;
+    return true;
+  });
+  const pendOutRange = pendRows.filter(e=>!inDate(e)).length;
   const sumNet = list => list.reduce((s,e)=>s+e.debit-e.credit,0);
 
   // 期初＝开始日前结转余额；期末＝日期范围末笔后余额（只按日期算，不受筛选影响）
@@ -922,19 +1156,14 @@ async function renderJournal(){
         const mIn = list.reduce((s,e)=>s+e.debit,0);
         const mOut = list.reduce((s,e)=>s+e.credit,0);
         const last = list[list.length-1];
-        return `<tr class="group-row month-row"><td></td><td colspan="10">📅 ${mo}　共 ${list.length} 笔<span class="hint">收 ${fmt(mIn)}　支 ${fmt(mOut)}</span><span style="float:right">月末实际余额 ${fmt(last._bbal)}</span></td></tr>`
-          + list.map(e=>journalRow(e)).join('');
+        return `<tr class="group-row month-row" data-sec="booked"><td></td><td colspan="10">📅 ${mo}　共 ${list.length} 笔<span class="hint">收 ${fmt(mIn)}　支 ${fmt(mOut)}</span><span style="float:right">月末实际余额 ${fmt(last._bbal)}</span></td></tr>`
+          + list.map(e=>journalRow(e,'booked')).join('');
       }).join('')
-    : bookedRows.map(e=>journalRow(e)).join('');
+    : bookedRows.map(e=>journalRow(e,'booked')).join('');
 
   c.innerHTML = `
   <div class="toolbar">
-    <select id="jrAcc" class="inp" data-change="jr-acc">
-      ${S.companies.map(cp=>`<optgroup label="${esc(cp.name)}">
-        ${S.accounts.filter(a=>a.company_id===cp.id).map(a=>
-          `<option value="${a.id}" ${a.id===S.jr.accId?'selected':''}>${esc(a.name)}（${esc(a.currency)}）</option>`).join('')}
-      </optgroup>`).join('')}
-    </select>
+    ${jrPickHTML()}
     <select id="jrPreset" class="inp" data-change="jr-preset" style="width:auto">
       <option value="all" ${S.jr.preset==='all'?'selected':''}>全部日期</option>
       <option value="thisMonth" ${S.jr.preset==='thisMonth'?'selected':''}>本月</option>
@@ -959,7 +1188,7 @@ async function renderJournal(){
     <button class="btn" data-action="planner" data-id="${S.jr.accId}">🧮 资金规划</button>
     <button class="btn primary" data-action="entry-add">＋ 新增流水</button>
   </div>
-  <div class="hint mb">按日期自动排序；表格分两段——<b>已入账</b>在上、<b>未兑现/未到账</b>在下。已入账段的余额与期初期末均为实际余额（不含未兑现/未到账款项）；在未兑现段勾选支票/待到账，可实时看到扣除后的余额。</div>
+  <div class="hint mb">按日期自动排序；表格分两段——<b>已入账</b>在上、<b>未兑现/未到账</b>在下。已入账段的余额与期初期末均为实际余额（不含未兑现/未到账款项）；<b>下方待兑付段固定列出该账户全部月份的未兑现/未到账</b>，不随日期范围收窄（不在本期的会标「非本期」）；勾选支票/待到账，可实时看到扣除后的余额。</div>
   <div class="tbl-wrap">
     <table class="tbl" id="jrTable">
       <thead><tr>
@@ -976,8 +1205,9 @@ async function renderJournal(){
           <td></td><td></td><td class="num" style="font-weight:700">${fmt(openBalBooked)}</td>
           <td colspan="4"></td>
         </tr>`:''}
-      <tr class="group-row"><td></td><td colspan="10">✅ 已入账（${bookedRows.length} 笔）<span class="hint">余额＝实际余额（不含未兑现/未到账）</span></td></tr>
-      ${bookedHTML || `<tr><td></td><td colspan="10" class="empty-hint">${rows.length?'当前筛选下没有已入账流水':'暂无流水，点右上角"新增流水"开始记账'}</td></tr>`}
+      <tr class="group-row foldable${jrFold.booked?' folded':''}" data-action="jr-fold" data-sec="booked"${bookedRows.length?' style="cursor:pointer"':' style="cursor:default"'}>
+        <td></td><td colspan="10"><span class="fold-caret">${jrFold.booked?'▸':'▾'}</span>✅ 已入账（${bookedRows.length} 笔）<span class="hint">余额＝实际余额（不含未兑现/未到账）</span>${bookedRows.length?`<span class="co-fold-tip">${jrFold.booked?'展开':'收起'}</span>`:''}</td></tr>
+      ${bookedHTML || `<tr data-sec="booked"><td></td><td colspan="10" class="empty-hint">${rows.length?'当前筛选下没有已入账流水':'暂无流水，点右上角"新增流水"开始记账'}</td></tr>`}
       <tr class="sum-row mid">
         <td></td>
         <td colspan="3">已入账合计<span class="muted small" style="margin-left:10px">共 ${bookedRows.length} 笔（当前筛选）</span></td>
@@ -986,11 +1216,13 @@ async function renderJournal(){
         <td class="num end-amt" id="jrBookedBal">余额 ${fmt(endBalBooked)}</td>
         <td colspan="4"></td>
       </tr>
-      <tr class="group-row"><td></td><td colspan="10">未兑现 / 未到账（${pendRows.length} 笔）<span class="hint">勾选＝模拟该笔已兑现/已到账，下方合计实时变化</span></td></tr>
-      ${pendRows.map(e=>journalRow(e)).join('') || '<tr><td></td><td colspan="10" class="empty-hint">没有未兑现/未到账的款项</td></tr>'}
+      <tr class="group-row foldable${jrFold.pend?' folded':''}" data-action="jr-fold" data-sec="pend"${pendRows.length?' style="cursor:pointer"':' style="cursor:default"'}>
+        <td></td><td colspan="10"><span class="fold-caret">${jrFold.pend?'▸':'▾'}</span>未兑现 / 未到账（${pendRows.length} 笔）
+        <span class="hint">含全部月份（不随上方日期范围变化）${pendOutRange?`，其中 ${pendOutRange} 笔不在所选期间`:''}；勾选＝模拟该笔已兑现/已到账，下方合计实时变化</span>${pendRows.length?`<span class="co-fold-tip">${jrFold.pend?'展开':'收起'}</span>`:''}</td></tr>
+      ${pendRows.map(e=>journalRow(e,'pend')).join('') || '<tr data-sec="pend"><td></td><td colspan="10" class="empty-hint">没有未兑现/未到账的款项</td></tr>'}
       <tr class="sum-row">
         <td></td>
-        <td colspan="3">未兑现 / 未到账合计（已勾选 <b id="jrPendN">0</b> / ${pendRows.length} 笔）<span class="muted small" style="margin-left:10px">截至 ${esc(endLabel)||'—'}，扣除后余额</span></td>
+        <td colspan="3">未兑现 / 未到账合计（已勾选 <b id="jrPendN">0</b> / ${pendRows.length} 笔）<span class="muted small" style="margin-left:10px">截至 ${esc(endLabel)||'—'} 已入账余额，扣除全部待兑付后</span></td>
         <td class="num green">收 <span id="jrPendIn">0.00</span></td>
         <td class="num red">支 <span id="jrPendOut">0.00</span></td>
         <td class="num end-amt" id="jrPendBal" data-base="${endBalBooked}">余额 <span id="jrPendBalNum">${fmt(endBalBooked)}</span></td>
@@ -999,16 +1231,20 @@ async function renderJournal(){
       </tbody>
     </table>
   </div>`;
+  // 重绘后把折叠状态回放到明细行（段头 caret 已由模板生成，这里补 display）
+  Object.keys(jrFold).forEach(sec=>{ if(jrFold[sec]) toggleJrSec(sec); });
+
   $('#jrQ').addEventListener('input', debounce(e=>{
     S.jr.q = e.target.value; renderJournalKeepFocus();
   }, 300));
 }
 
-function journalRow(e){
+function journalRow(e, sec){
+  const outOfRange = e.pending && ((S.jr.from && e.date < S.jr.from) || (S.jr.to && e.date > S.jr.to));
   return `
-    <tr class="${e.pending?'pendrow':''}" data-action="entry-edit" data-id="${e.id}">
+    <tr class="${e.pending?'pendrow':''}" data-sec="${sec||(e.pending?'pend':'booked')}" data-action="entry-edit" data-id="${e.id}">
       <td class="chk-cell">${e.pending?`<input type="checkbox" data-change="jr-pend-check" data-id="${e.id}" onclick="event.stopPropagation()">`:''}</td>
-      <td style="white-space:nowrap">${esc(e.date)}</td>
+      <td style="white-space:nowrap">${esc(e.date)}${outOfRange?'<span class="cur-chip" title="不在上方所选日期范围内">非本期</span>':''}</td>
       <td style="white-space:nowrap">${esc(e.check_no)}</td>
       <td class="desc-cell">${esc(e.description)}${e.party?`<div class="party">对方：${esc(e.party)}</div>`:''}${e.project?`<div class="party">项目：${esc(e.project)}</div>`:''}</td>
       <td class="num green">${e.debit?fmt(e.debit):''}</td>
@@ -1328,7 +1564,8 @@ function recalcPlan(bank){
 async function renderDeposits(){
   const c = $('#content');
   if(!S.company){ c.innerHTML='<div class="card empty-hint">请先新建公司</div>'; return; }
-  const list = await api('/api/deposits?company_id='+S.company);
+  const withCo = isAllCo();
+  const list = await api('/api/deposits' + (withCo ? '' : '?company_id=' + S.company));
   const totals = {};
   list.forEach(d=>totals[d.currency]=(totals[d.currency]||0)+d.principal);
   const dueN = list.filter(d=>depStatus(d).level===2).length;
@@ -1337,8 +1574,10 @@ async function renderDeposits(){
   <div class="toolbar">
     <span class="hint">定期到期/转存请在此维护；到期利息＝本金×年利率×天数÷365（到期状态按今天 ${esc(S.today)} 计算）</span>
     <span class="sep"></span>
-    <a class="btn" href="/api/export/excel?type=deposits&company_id=${S.company}">📥 导出Excel</a>
-    <button class="btn primary" data-action="dep-add">＋ 新增定期</button>
+    ${withCo
+      ? `<span class="btn" style="opacity:.45;cursor:not-allowed" title="导出定期表需要指定公司">📥 导出Excel</span>`
+      : `<a class="btn" href="/api/export/excel?type=deposits&company_id=${S.company}">📥 导出Excel</a>`}
+    <button class="btn primary" data-action="dep-add"${withCo?' disabled title="新增定期要归属到某个公司，请先在左上角选择具体公司"':''}>＋ 新增定期</button>
   </div>
   ${(dueN||soonN)?`<div class="alert-bar">
     <span>⏰ ${dueN?`<b class="red">${dueN} 笔已到期</b>`:''}${dueN&&soonN?'　':''}${soonN?`<b class="amber">${soonN} 笔 30 天内到期</b>`:''}</span>
@@ -1350,32 +1589,55 @@ async function renderDeposits(){
       <th class="num">年利率</th><th>开始日期</th><th>到期日</th><th class="num">总天数</th>
       <th class="num">到期利息</th><th>状态</th><th>备注</th><th></th>
     </tr></thead><tbody>
-    ${list.map(d=>{
-      const days = depDays(d);
-      const it = depInterestOf(d);
-      const st = depStatus(d);
-      return `<tr class="${st.row}" data-action="dep-edit" data-id="${d.id}">
-        <td>${esc(d.bank)}</td><td>${esc(d.order_no)}</td><td>${esc(d.currency)}</td>
-        <td class="num">${fmt(d.principal)}</td><td>${esc(d.period)}</td>
-        <td class="num">${(d.rate*100).toFixed(2)}%</td><td>${esc(d.start_date)}</td><td>${esc(d.end_date)}</td>
-        <td class="num">${days||''}</td><td class="num">${days?fmt(it):''}</td>
-        <td>${st.label}</td>
-        <td>${esc(d.note)}</td>
-        <td><button class="btn sm danger" data-action="dep-del" data-id="${d.id}">删除</button></td></tr>`;
-    }).join('') || '<tr><td colspan="13" class="empty-hint">暂无定期记录</td></tr>'}
+    ${(withCo
+      ? (S.companies.map(cp=>{
+          const items = list.filter(d=>d.company_id===cp.id);
+          if(!items.length) return '';
+          const folded = depFoldCo.has(cp.id);
+          const byCur = {};
+          items.forEach(d=>byCur[d.currency]=(byCur[d.currency]||0)+d.principal);
+          const mop = items.reduce((s,d)=>s+d.principal*rateOf(d.currency),0);
+          const dueN2 = items.filter(d=>depStatus(d).level===2).length;
+          const soonN2 = items.filter(d=>depStatus(d).level===1).length;
+          return `<tr class="group-row foldable${folded?' folded':''}" data-action="dep-fold-co" data-key="${cp.id}" style="cursor:pointer">
+              <td colspan="13"><span class="fold-caret">${folded?'▸':'▾'}</span> 🏢 ${esc(cp.name)}
+                <span class="hint">${items.length} 笔　${Object.entries(byCur).map(([k,v])=>`${esc(k)} ${fmt(v)}`).join('　·　')}　折 MOP ${fmtI(mop)}</span>
+                ${dueN2?`<b class="red" style="margin-left:8px">${dueN2} 笔已到期</b>`:''}${soonN2?`<b class="amber" style="margin-left:8px">${soonN2} 笔将到期</b>`:''}
+                <span class="co-fold-tip">${folded?'展开':'收起'}</span></td></tr>`
+            + items.map(d=>depRow(d, cp.id)).join('');
+        }).join('') || `<tr><td colspan="13" class="empty-hint">暂无定期记录</td></tr>`)
+      : (list.map(depRow).join('') || `<tr><td colspan="13" class="empty-hint">暂无定期记录</td></tr>`))}
     </tbody>
     <tfoot><tr><td colspan="3">合计</td>
       <td class="num" colspan="10">${Object.entries(totals).map(([k,v])=>`${esc(k)} ${fmt(v)}`).join('　·　')||''}</td></tr></tfoot>
     </table>
   </div>`;
 }
+
+/* 定期存款一行 */
+function depRow(d, coId){
+  const days = depDays(d);
+  const it = depInterestOf(d);
+  const st = depStatus(d);
+  // 按公司分组后，行内不再重复公司名（单公司模式本来也不需要）
+  const coTip = '';
+  return `<tr class="${st.row}" data-action="dep-edit" data-id="${d.id}"${coId?` data-co="${coId}"`:''}>
+    <td>${esc(d.bank)}${coTip}</td><td>${esc(d.order_no)}</td><td>${esc(d.currency)}</td>
+    <td class="num">${fmt(d.principal)}</td><td>${esc(d.period)}</td>
+    <td class="num">${(d.rate*100).toFixed(2)}%</td><td>${esc(d.start_date)}</td><td>${esc(d.end_date)}</td>
+    <td class="num">${days||''}</td><td class="num">${days?fmt(it):''}</td>
+    <td>${st.label}</td>
+    <td>${esc(d.note)}</td>
+    <td><button class="btn sm danger" data-action="dep-del" data-id="${d.id}">删除</button></td></tr>`;
+}
 function depInterest(){
   const f = $('#depForm'); if(!f) return 0;
   const days = dayDiff(f.end_date.value, f.start_date.value);
   return days>0 ? (parseFloat(f.principal.value)||0)*(parseFloat(f.rate.value)||0)*days/365 : 0;
 }
-function openDepModal(id){
+async function openDepModal(id){
   const isNew=!id;
+  let editing = null;
   const d = isNew
     ? {id:null, bank:'华人银行', order_no:'', currency:'HKD', principal:'', period:'6M',
        rate:'', start_date:S.today, end_date:'', note:''}
@@ -1401,14 +1663,16 @@ function openDepModal(id){
       </div>
     </form>`);
   if(!isNew){
-    const dep = api('/api/deposits?company_id='+S.company).then(list=>{
-      const x = list.find(v=>v.id===id); if(!x) return;
+    const list = await api('/api/deposits' + (isAllCo() ? '' : '?company_id=' + S.company));
+    const x = list.find(v=>v.id===id);
+    if(x){
+      editing = x;
       const f=$('#depForm');
       f.bank.value=x.bank; f.order_no.value=x.order_no; f.currency.value=x.currency;
       f.principal.value=x.principal; f.period.value=x.period; f.rate.value=x.rate;
       f.start_date.value=x.start_date; f.end_date.value=x.end_date; f.note.value=x.note;
       f.dataset.did=x.id; updIt();
-    });
+    }
   }
   const form = $('#depForm');
   // 到期日：用户未手改时，随"开始日期/定存期"自动推算
@@ -1432,7 +1696,7 @@ function openDepModal(id){
     ev.preventDefault();
     const fd = new FormData(ev.target);
     const body = Object.fromEntries(fd.entries());
-    body.company_id = S.company;
+    body.company_id = editing ? editing.company_id : S.company;
     try{
       if(form.dataset.did) await jput('/api/deposits/'+form.dataset.did, body);
       else await jpost('/api/deposits', body);
@@ -2888,6 +3152,7 @@ async function agentSend(text){
       body: JSON.stringify({
         message: msg || '请看我上传的附件，说明关键内容',
         history, sid: agentSid(),
+        company_id: S.company,          // 界面当前公司：'all' 或公司 id，让 agent 和界面看到同一家
         attachments: atts.map(a => a.fid),
       }),
       signal: ctrl.signal,
@@ -3153,7 +3418,9 @@ document.addEventListener('click', async e=>{
   try{
     switch(act){
       case 'nav': switchView(el.dataset.view); break;
-      case 'cash-add': openCashCount(null); break;
+      case 'cash-add':
+        if(isAllCo()){ alert('盘点单要归属到某个公司，请先在左上角「当前公司」选择具体公司。'); break; }
+        openCashCount(null); break;
       case 'cash-edit': openCashCount(+el.dataset.id); break;
       case 'cash-copy': {
         e.stopPropagation();                     // 别同时触发整行的“查看/编辑”
@@ -3176,8 +3443,8 @@ document.addEventListener('click', async e=>{
         renderCash(); break;
       }
       case 'cash-goto-journal': {
-        const a = S.accounts.find(x=>x.company_id===S.company && x.kind==='cash');
-        if(!a){ alert('该公司还没有现金账户'); break; }
+        const a = coAccs().find(x=>x.kind==='cash');
+        if(!a){ alert('还没有现金账户'); break; }
         S.jr={accId:a.id,account:null,entries:[],loaded:false,from:'',to:'',preset:'all',q:'',status:'',tagId:''};
         switchView('journal'); break;
       }
@@ -3322,6 +3589,34 @@ document.addEventListener('click', async e=>{
         S.jr={accId,account:null,entries:[],loaded:false,from:el.dataset.month+'-01',to:monthEndStr(el.dataset.month),preset:'custom',q:'',status:'',tagId:''};
         closeModal(); switchView('journal'); break;
       }
+      case 'rem-fold-co': {
+        const k = el.dataset.key;
+        const nowFold = !remFold.co.has(k);
+        if(nowFold) remFold.co.add(k); else remFold.co.delete(k);
+        applyRemFold(el, nowFold);
+        break;
+      }
+      case 'rem-fold-grp': {
+        const k = el.dataset.key;
+        const nowFold = !remFold.grp.has(k);
+        if(nowFold) remFold.grp.add(k); else remFold.grp.delete(k);
+        applyRemFold(el, nowFold);
+        break;
+      }
+      case 'rem-fold-all': {
+        const fold = el.dataset.fold === '1';
+        remFold.co.clear(); remFold.grp.clear();
+        if(fold){
+          for(const c of reminderGroups(activeReminders())){
+            remFold.co.add(remCoKey(c));
+            for(const g of c.groups) remFold.grp.add(remGrpKey(c, g));
+          }
+        }
+        // 整块重绘；收起后总高度变小，回到顶部更合理
+        remScrollTop = 0;
+        renderReminderModal(true);
+        break;
+      }
       case 'note-detail': {
         const r = (S.reminders||[]).find(x=>x.id === +el.dataset.id);
         if(!r) break;
@@ -3426,6 +3721,31 @@ document.addEventListener('click', async e=>{
       }
       case 'planner': await openPlanner(+el.dataset.id||S.jr.accId); break;
       case 'jr-month-toggle': jrGroupMonth = !jrGroupMonth; renderJournal(); break;
+      case 'jr-fold': {
+        const sec = el.dataset.sec;
+        if(!sec) break;
+        jrFold[sec] = !jrFold[sec];
+        toggleJrSec(sec);
+        break;
+      }
+      case 'apick-toggle': jrPickOpen = !jrPickOpen; paintJrPick(); break;
+      case 'apick-co': {
+        const co = +el.dataset.co;
+        if(jrCollapsedCo.has(co)) jrCollapsedCo.delete(co); else jrCollapsedCo.add(co);
+        paintJrPick();
+        break;
+      }
+      case 'apick-pick': {
+        const aid = +el.dataset.id;
+        if(!aid) break;
+        S.jr.accId = aid;
+        S.jr.account = null;
+        S.jr.entries = [];
+        S.jr.loaded = false;
+        jrPickOpen = false;
+        renderJournal();
+        break;
+      }
       case 'plan-sel': {
         const v = el.dataset.v==='all';
         $$('#modalBox [data-change="plan-check"]').forEach(cb=>cb.checked=v);
@@ -3464,7 +3784,19 @@ document.addEventListener('click', async e=>{
         break;
       }
       case 'att-open': window.open(`/api/attachments/${el.dataset.id}/file`); break;
-      case 'dep-add': openDepModal(null); break;
+      case 'cash-fold-co':
+      case 'dep-fold-co': {
+        const isCash = act === 'cash-fold-co';
+        const set = isCash ? cashFoldCo : depFoldCo;
+        const key = +el.dataset.key;
+        const folded = !set.has(key);
+        if(folded) set.add(key); else set.delete(key);
+        toggleCoFold(el, folded, key);
+        break;
+      }
+      case 'dep-add':
+        if(isAllCo()){ alert('新增定期存款要归属到某个公司，请先在左上角「当前公司」选择具体公司。'); break; }
+        await openDepModal(null); break;
       case 'dep-edit': if(e.target.closest('[data-action]').dataset.action==='dep-edit') openDepModal(+el.dataset.id); break;
       case 'dep-del': {
         e.stopPropagation();

@@ -657,12 +657,14 @@ def del_tag(tid):
 # ---------------------------------------------------------------- deposits (定期)
 @app.get('/api/deposits')
 def list_deposits():
-    cid = request.args.get('company_id', type=int)
-    if not cid:
-        return bad('缺少 company_id')
+    cid = request.args.get('company_id', type=int)   # 不传＝全部公司
     db = get_db()
-    rows = db.execute('SELECT * FROM deposits WHERE company_id=? '
-                      'ORDER BY start_date, id', (cid,)).fetchall()
+    if cid:
+        rows = db.execute('SELECT * FROM deposits WHERE company_id=? '
+                          'ORDER BY start_date, id', (cid,)).fetchall()
+    else:
+        rows = db.execute('SELECT * FROM deposits '
+                          'ORDER BY company_id, start_date, id').fetchall()
     return jsonify([rowdict(r) for r in rows])
 
 
@@ -755,10 +757,15 @@ def set_rates():
 
 # ---------------------------------------------------------------- 库存现金 / 盘点
 def _cash_book_at(db, company_id, upto=''):
-    """该公司各现金账户截至 upto（含当日）的账面余额，按币种汇总"""
-    rows = db.execute(
-        "SELECT * FROM accounts WHERE company_id=? AND kind='cash' "
-        "ORDER BY sort, id", (company_id,)).fetchall()
+    """各现金账户截至 upto（含当日）的账面余额；company_id 为空＝全部公司"""
+    if company_id:
+        rows = db.execute(
+            "SELECT * FROM accounts WHERE company_id=? AND kind='cash' "
+            "ORDER BY sort, id", (company_id,)).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT * FROM accounts WHERE kind='cash' "
+            "ORDER BY company_id, sort, id").fetchall()
     out = []
     for a in rows:
         sql = ('SELECT COALESCE(SUM(debit),0) d, COALESCE(SUM(credit),0) c, '
@@ -805,9 +812,7 @@ def _cash_count_payload(db, cid):
 
 @app.get('/api/cash/book')
 def cash_book():
-    cid = request.args.get('company_id', type=int)
-    if not cid:
-        return bad('缺少 company_id')
+    cid = request.args.get('company_id', type=int)   # 不传＝全部公司
     d = (request.args.get('date') or '').strip()
     if d and not DATE_RE.match(d):
         return bad('日期格式应为 YYYY-MM-DD')
@@ -819,14 +824,17 @@ def cash_book():
 
 @app.get('/api/cash/counts')
 def list_cash_counts():
-    cid = request.args.get('company_id', type=int)
-    if not cid:
-        return bad('缺少 company_id')
+    cid = request.args.get('company_id', type=int)   # 不传＝全部公司
     db = get_db()
     rates = {r['currency']: r['rate'] for r in db.execute('SELECT * FROM rates')}
     out = []
-    for h in db.execute('SELECT * FROM cash_counts WHERE company_id=? '
-                        'ORDER BY count_date DESC, id DESC', (cid,)):
+    if cid:
+        heads = db.execute('SELECT * FROM cash_counts WHERE company_id=? '
+                           'ORDER BY count_date DESC, id DESC', (cid,))
+    else:
+        heads = db.execute('SELECT * FROM cash_counts '
+                           'ORDER BY count_date DESC, id DESC')
+    for h in heads:
         items = []
         for it in db.execute('SELECT * FROM cash_count_items WHERE count_id=? '
                              'ORDER BY id', (h['id'],)):
@@ -1207,13 +1215,13 @@ def export_cash_counts():
 # ---------------------------------------------------------------- dashboard
 @app.get('/api/dashboard')
 def dashboard():
-    cid = request.args.get('company_id', type=int)
-    if not cid:
-        return bad('缺少 company_id')
+    cid = request.args.get('company_id', type=int)   # 不传＝全部公司
     db = get_db()
+    accs_row = (db.execute('SELECT * FROM accounts WHERE company_id=? '
+                           'ORDER BY sort, id', (cid,)) if cid else
+                db.execute('SELECT * FROM accounts ORDER BY company_id, sort, id'))
     accounts = []
-    for a in db.execute('SELECT * FROM accounts WHERE company_id=? '
-                        'ORDER BY sort, id', (cid,)):
+    for a in accs_row:
         agg = db.execute(
             'SELECT COALESCE(SUM(debit),0) d, COALESCE(SUM(credit),0) c, '
             'COALESCE(SUM(CASE WHEN pending=1 THEN debit END),0) pd, '
@@ -1226,18 +1234,37 @@ def dashboard():
                          'book': book, 'bank': bank,
                          'pending_debit': agg['pd'], 'pending_credit': agg['pc'],
                          'entry_count': agg['n']})
-    monthly = [rowdict(r) for r in db.execute(
-        'SELECT substr(e.date,1,7) month, e.account_id, '
-        'COALESCE(SUM(e.debit),0) debit, COALESCE(SUM(e.credit),0) credit '
-        'FROM entries e JOIN accounts a ON a.id=e.account_id '
-        'WHERE a.company_id=? GROUP BY month, e.account_id ORDER BY month', (cid,))]
-    tag_counts = {r['tag_id']: r['c'] for r in db.execute(
-        'SELECT et.tag_id, COUNT(*) c FROM entry_tags et '
-        'JOIN entries e ON e.id=et.entry_id '
-        'JOIN accounts a ON a.id=e.account_id '
-        'WHERE a.company_id=? GROUP BY et.tag_id', (cid,))}
-    deposits = [rowdict(r) for r in db.execute(
-        'SELECT * FROM deposits WHERE company_id=? ORDER BY start_date, id', (cid,))]
+    if cid:
+        monthly = [rowdict(r) for r in db.execute(
+            'SELECT substr(e.date,1,7) month, e.account_id, '
+            'COALESCE(SUM(e.debit),0) debit, COALESCE(SUM(e.credit),0) credit '
+            'FROM entries e JOIN accounts a ON a.id=e.account_id '
+            'WHERE a.company_id=? GROUP BY month, e.account_id ORDER BY month',
+            (cid,))]
+    else:
+        monthly = [rowdict(r) for r in db.execute(
+            'SELECT substr(e.date,1,7) month, e.account_id, '
+            'COALESCE(SUM(e.debit),0) debit, COALESCE(SUM(e.credit),0) credit '
+            'FROM entries e JOIN accounts a ON a.id=e.account_id '
+            'GROUP BY month, e.account_id ORDER BY month')]
+    if cid:
+        tag_counts = {r['tag_id']: r['c'] for r in db.execute(
+            'SELECT et.tag_id, COUNT(*) c FROM entry_tags et '
+            'JOIN entries e ON e.id=et.entry_id '
+            'JOIN accounts a ON a.id=e.account_id '
+            'WHERE a.company_id=? GROUP BY et.tag_id', (cid,))}
+    else:
+        tag_counts = {r['tag_id']: r['c'] for r in db.execute(
+            'SELECT et.tag_id, COUNT(*) c FROM entry_tags et '
+            'JOIN entries e ON e.id=et.entry_id '
+            'JOIN accounts a ON a.id=e.account_id GROUP BY et.tag_id')}
+    if cid:
+        deposits = [rowdict(r) for r in db.execute(
+            'SELECT * FROM deposits WHERE company_id=? ORDER BY start_date, id',
+            (cid,))]
+    else:
+        deposits = [rowdict(r) for r in db.execute(
+            'SELECT * FROM deposits ORDER BY company_id, start_date, id')]
     # 库存现金：按币种汇总 + 最近一次盘点
     cash_accs = [a for a in accounts if (a.get('kind') or 'bank') == 'cash']
     cash_by_cur = {}
@@ -1245,9 +1272,14 @@ def dashboard():
         o = cash_by_cur.setdefault(a['currency'], {'book': 0.0, 'n': 0})
         o['book'] += a['book']
         o['n'] += 1
-    last_count = db.execute(
-        'SELECT * FROM cash_counts WHERE company_id=? '
-        'ORDER BY count_date DESC, id DESC LIMIT 1', (cid,)).fetchone()
+    if cid:
+        last_count = db.execute(
+            'SELECT * FROM cash_counts WHERE company_id=? '
+            'ORDER BY count_date DESC, id DESC LIMIT 1', (cid,)).fetchone()
+    else:
+        last_count = db.execute(
+            'SELECT * FROM cash_counts '
+            'ORDER BY count_date DESC, id DESC LIMIT 1').fetchone()
     cash_last = None
     if last_count:
         pl = _cash_count_payload(db, last_count['id'])

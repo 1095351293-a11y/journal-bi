@@ -450,13 +450,13 @@ def t_aggregate_entries(args):
         return {'error': f'group_by 只支持 {list(_AGG_GROUP)}'}, []
     cond, p = [], []
 
-    def add_num(k, col):
-        if args.get(k):
-            cond.append(f'{col}>=?')
-            p.append(str(args[k]))
-
-    add_num('date_from', 'e.date')
-    add_num('date_to', 'e.date')
+    # 起始用 >=、结束用 <=（原来两个都写成 >=，带 date_to 时永远查不到数据）
+    if args.get('date_from'):
+        cond.append('e.date>=?')
+        p.append(str(args['date_from']))
+    if args.get('date_to'):
+        cond.append('e.date<=?')
+        p.append(str(args['date_to']))
     if args.get('company_id'):
         cond.append('a.company_id=?')
         p.append(int(args['company_id']))

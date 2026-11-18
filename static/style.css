@@ -180,10 +180,28 @@ button{font-family:inherit}
 .note-remind-item .nr-note{color:var(--amber);font-weight:600}
 .rem-company{margin-bottom:16px}
 .rem-company-head{display:flex;align-items:center;gap:8px;font-weight:700;font-size:14px;
-  padding:6px 2px 8px;border-bottom:2px solid #e2e8f0;margin-bottom:8px}
+  padding:6px 8px 8px;border-bottom:2px solid #e2e8f0;margin-bottom:8px;
+  cursor:pointer;border-radius:8px 8px 0 0;transition:background .12s}
+.rem-company-head:hover{background:#f1f5f9}
+.rem-company.folded .rem-company-head{border-bottom-color:#cbd5e1;margin-bottom:0}
 .rem-group{border:1px solid #e2e8f0;border-radius:10px;margin-bottom:10px;overflow:hidden}
 .rem-group-head{display:flex;align-items:center;gap:8px;padding:8px 10px;
-  background:#f8fafc;border-bottom:1px solid #eef2f7}
+  background:#f8fafc;border-bottom:1px solid #eef2f7;cursor:pointer;
+  transition:background .12s}
+.rem-group-head:hover{background:#eef2f7}
+.rem-group.folded .rem-group-head{border-bottom:none}
+/* 收起用的三角与右侧“收起/展开”轻提示 */
+.fold-caret{display:inline-block;flex:0 0 auto;width:12px;text-align:center;
+  color:#94a3b8;font-size:11px;line-height:1}
+.rem-fold-tip{margin-left:auto;flex:0 0 auto;font-weight:400;font-size:11px;
+  color:#94a3b8;border:1px solid #e2e8f0;background:#fff;border-radius:99px;
+  padding:1px 8px}
+.rem-company-head:hover .rem-fold-tip,
+.rem-group-head:hover .rem-fold-tip{color:#475569;border-color:#cbd5e1}
+.rem-topline{display:flex;align-items:flex-start;gap:10px;margin-bottom:10px}
+.rem-topline .hint{flex:1;min-width:0}
+.rem-topbtns{flex:0 0 auto;display:flex;gap:6px}
+.rem-company .note-remind-item{padding:9px 10px}
 .rem-group .note-remind-item{padding:9px 10px}
 /* 列表顶部的一行轻提示：不用弹窗打断 */
 .rem-tip{margin:0 0 10px;padding:7px 10px;border-radius:8px;font-size:12.5px;
@@ -603,3 +621,57 @@ body.agent-open.side-open #main{margin-right:calc(var(--agent-w) + 210px)}
 /* 卡片内的描述列允许换行（它是自己控制的两行结构） */
 .ag-prop-tbl td.ag-prop-desc,.ag-prop-tbl td.ag-prop-desc *{white-space:normal!important;
   word-break:break-word}
+
+/* ---------- 日记账账户选择器（全部公司时按公司分组、可收起） ---------- */
+.apick{position:relative;display:inline-block;min-width:235px;max-width:360px;flex:0 1 auto}
+.apick-btn{display:flex;align-items:center;gap:8px;width:100%;text-align:left;
+  border:1px solid var(--line);background:var(--card);border-radius:8px;
+  padding:6px 10px;font-size:13px;cursor:pointer;line-height:1.35}
+.apick-btn:hover{border-color:#cbd5e1}
+.apick-ico{flex:0 0 auto;font-size:14px}
+.apick-txt{flex:1;min-width:0;display:flex;flex-direction:column}
+.apick-co{font-size:10px;color:var(--muted);line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.apick-nm{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.apick-arw{flex:0 0 auto;color:var(--muted);font-size:11px}
+.apick-panel{position:absolute;z-index:60;top:calc(100% + 4px);left:0;
+  min-width:100%;max-width:520px;width:max-content;
+  background:var(--card);border:1px solid var(--line);border-radius:10px;
+  box-shadow:0 12px 32px rgba(15,23,42,.16);max-height:60vh;overflow:auto;padding:4px}
+.apick-panel.hidden{display:none}
+.apick-grp + .apick-grp{border-top:1px solid var(--line)}
+.apick-gh{display:flex;align-items:center;gap:7px;width:100%;border:none;background:#f8fafc;
+  padding:8px 10px;font-size:12px;font-weight:700;color:#334155;cursor:pointer;
+  border-radius:6px;text-align:left}
+.apick-gh:hover{background:#eef2f7}
+.apick-gh.col{color:#475569}
+.apick-chv{flex:0 0 12px;font-size:11px;color:var(--muted)}
+.apick-gname{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.apick-cnt{flex:0 0 auto;font-size:10px;font-weight:700;color:#475569;background:#e2e8f0;
+  border-radius:99px;padding:0 7px;line-height:16px}
+.apick-items{padding:2px 0 4px}
+.apick-it{display:flex;align-items:center;gap:7px;width:100%;border:none;background:none;
+  padding:7px 10px 7px 22px;font-size:13px;color:inherit;cursor:pointer;text-align:left;border-radius:6px}
+.apick-it:hover{background:#f1f5f9}
+.apick-it.on{background:var(--blue-soft);color:var(--blue);font-weight:600}
+.apick-it-ico{flex:0 0 auto;font-size:12px}
+.apick-it-nm{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.apick-it-cur{flex:0 0 auto;font-size:10px;font-weight:700;color:#475569;background:#e2e8f0;
+  border-radius:99px;padding:0 6px;line-height:15px}
+.apick-it.on .apick-it-cur{background:#dbeafe;color:var(--blue)}
+.apick-tick{flex:0 0 auto;font-size:12px}
+.apick-empty{padding:14px;text-align:center;color:var(--muted);font-size:12px}
+
+/* 看板：全部公司时按公司分组的标题 */
+.co-group-head{display:flex;align-items:baseline;gap:10px;margin:14px 0 8px;
+  font-size:14px;font-weight:700;color:#334155}
+.co-group-head .hint{font-weight:400}
+/* 可收起的公司分组（现金 / 定期） */
+.co-group-head.foldable{cursor:pointer;align-items:center;border-radius:8px;padding:4px 6px;
+  transition:background .12s}
+.co-group-head.foldable:hover{background:#f1f5f9}
+.co-fold-tip{margin-left:auto;flex:0 0 auto;font-weight:400;font-size:11px;color:#94a3b8;
+  border:1px solid #e2e8f0;background:#fff;border-radius:99px;padding:1px 8px}
+.co-group-head.foldable:hover .co-fold-tip,
+.tbl .group-row.foldable:hover .co-fold-tip{color:#475569;border-color:#cbd5e1}
+.tbl .group-row.foldable{cursor:pointer}
+.tbl .group-row.foldable .co-fold-tip{float:right;margin-left:10px;font-weight:400}

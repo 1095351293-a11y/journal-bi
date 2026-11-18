@@ -296,18 +296,27 @@ def resolve_account(args):
         return None, ('要指定账户，可选：'
                       + '、'.join(f"{a['name']}({a['currency']})" for a in cand[:10]))
     # 精确 → 包含 → 账号包含
-    for a in cand:
-        if kw == a['name']:
-            return a, None
+    # 同名账户在多家公司都有时不能直接取第一个，必须让调用方补公司——
+    # 否则「库存现金（人民币）」这种名字会静默落到第一家公司的账上。
+    def _label(a):
+        cn = next((c['name'] for c in _companies() if c['id'] == a['company_id']), '')
+        return f"{cn}·{a['name']}({a['currency']})"
+    exact = [a for a in cand if kw == a['name']]
+    if len(exact) == 1:
+        return exact[0], None
+    if len(exact) > 1:
+        return None, ('有多家公司都有同名账户「' + kw + '」，请说清是哪一家：'
+                      + '、'.join(_label(a) for a in exact[:8])
+                      + '（可以带 company 参数再试）')
     hits = [a for a in cand if kw in (a['name'] or '') or
             (a['account_no'] and kw in a['account_no'])]
     if len(hits) == 1:
         return hits[0], None
     if len(hits) > 1:
         return None, ('有多个账户都对得上，请说清楚是哪个：'
-                      + '、'.join(f"{a['name']}({a['currency']})" for a in hits[:8]))
+                      + '、'.join(_label(a) for a in hits[:8]))
     return None, ('找不到账户「' + kw + '」，可选：'
-                  + '、'.join(f"{a['name']}({a['currency']})" for a in cand[:10]))
+                  + '、'.join(_label(a) for a in cand[:10]))
 
 
 def resolve_tags(names):

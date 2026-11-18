@@ -516,6 +516,53 @@ def _company_name():
         return ''
 
 
+def _company_block(company_id=None):
+    """系统提示词里的「公司与范围」段：用户当前选的公司 + 全部公司清单 + 跨公司规则。
+
+    company_id 由前端随对话一起送上来（'all' 或数字），保证 agent 和界面看到的是同一家。
+    """
+    try:
+        cs = rows('SELECT c.id, c.name, '
+                  '(SELECT COUNT(*) FROM accounts a WHERE a.company_id=c.id) n '
+                  'FROM companies c ORDER BY c.sort, c.id')
+    except Exception:
+        cs = []
+    if not cs:
+        return '账本里还没有公司。新增公司、账户请用 manage_company / manage_account。'
+    raw = str(company_id if company_id is not None else '').strip()
+    picked = None
+    if raw and raw.lower() not in ('all', '全部', 'none', 'null', '0', 'undefined'):
+        try:
+            k = int(float(raw))
+            picked = next((c for c in cs if c['id'] == k), None)
+        except Exception:
+            picked = next((c for c in cs if raw and raw in (c['name'] or '')), None)
+        picked = picked or None
+    lines = []
+    if raw.lower() in ('all', '全部'):
+        lines.append(f'用户当前在界面选的是「全部公司」（共 {len(cs)} 家）。'
+                     '没提公司的问题按全部公司回答，可以做跨公司汇总和对比。')
+    elif picked:
+        lines.append(f'用户当前在界面选的是「{picked["name"]}」'
+                     f'（company_id={picked["id"]}，{picked["n"]} 个账户）。'
+                     '没提公司时，默认就是这家。')
+    else:
+        lines.append('用户没说明当前公司：任何涉及具体公司的操作，先问清是哪一家。')
+    lines.append(f'账本共 {len(cs)} 家公司：')
+    for i, c in enumerate(cs, 1):
+        lines.append(f'{i}. {c["name"]}（company_id={c["id"]}，{c["n"]} 个账户）')
+    lines.append('跨公司规则（重要）：')
+    lines.append('- 查询：`company_id` 省略＝全部公司。用户点名别家公司就直接查那家，'
+                 '不需要用户先切换界面，也不要说「请先切换到某公司」。')
+    lines.append('- 跨公司比较/汇总：用 data_overview 或 aggregate_entries（不传 company_id）'
+                 '一次算完，不要拆成多次单公司查询再加总。')
+    lines.append('- 写入（记一笔、改流水、建定期、盘点、改账户）：必须落到具体账户。'
+                 '用户没说公司时按当前公司；当前是「全部公司」、或同名账户在多家公司都有时，'
+                 '必须先问清楚是哪一家，绝不能猜一个写进去。')
+    lines.append('- 写入前说清「公司 + 账户 + 金额 + 日期」，让用户一眼能核对。')
+    return '\n'.join(lines)
+
+
 def _typewriter(s):
     step = 14
     for i in range(0, len(s), step):
@@ -523,7 +570,7 @@ def _typewriter(s):
         time.sleep(0.008)
 
 
-def run_agent_stream(cfg, sid, history, text, atts=None):
+def run_agent_stream(cfg, sid, history, text, atts=None, company_id=None):
     """yield 事件 dict；由 SSE 层序列化。"""
     t0 = time.time()
     atts = atts or []
@@ -552,7 +599,7 @@ def run_agent_stream(cfg, sid, history, text, atts=None):
 
         # 历史 + 本轮输入
         messages = [{'role': 'system',
-                     'content': build_system(sid, _company_name())}]
+                     'content': build_system(sid, _company_block(company_id))}]
         for h in (history or [])[-12:]:
             role = h.get('role')
             if role in ('user', 'assistant') and h.get('content'):
@@ -731,7 +778,7 @@ def chat_stream():
             yield sse({'t': 'start', 'model': cfg.get('model'),
                        'vision': vision_capable(cfg)})
             for ev in run_agent_stream(cfg, sid, data.get('history') or [],
-                                       text, atts):
+                                       text, atts, data.get('company_id')):
                 yield sse(ev)
         except GeneratorExit:
             return
