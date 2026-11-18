@@ -320,16 +320,28 @@ def resolve_account(args):
                   + '、'.join(_label(a) for a in cand[:10]))
 
 
+def _tag_names(raw):
+    """标签参数统一成去重后的名字列表；字符串支持逗号/顿号分隔。"""
+    if raw is None:
+        return []
+    source = (raw if isinstance(raw, (list, tuple))
+              else str(raw).replace('，', ',').replace('、', ',').split(','))
+    out = []
+    for x in source:
+        n = str(x or '').strip().lstrip('#').strip()
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
 def resolve_tags(names):
     """标签名 → id；不存在的先不建，留给执行阶段建。"""
+    names = _tag_names(names)
     if not names:
         return [], []
     out_ids, out_names = [], []
     all_t = _fetch('SELECT id, name FROM tags')
-    for raw in names:
-        n = str(raw or '').strip().lstrip('#')
-        if not n:
-            continue
+    for n in names:
         hit = next((t for t in all_t if t['name'] == n), None)
         if hit:
             out_ids.append(hit['id'])
@@ -536,6 +548,7 @@ def w_propose_update(args):
 
 
     after, changes, warns = {}, [], []
+    tag_same, cur_tags = False, []
     for k in ('description', 'party', 'project', 'note', 'check_no'):
         if args.get(k) is not None:
             nv = str(args.get(k) or '').strip()
@@ -577,13 +590,34 @@ def w_propose_update(args):
                             'to': f"{row['currency']} {amt:,.2f}"})
             after['debit'], after['credit'] = nd_debit, nd_credit
             warns.append(f'金额会被改写：{old_amt:,.2f} → {amt:,.2f}，请核对')
-    if args.get('tags') is not None:
-        ids, names = resolve_tags(args.get('tags'))
-        changes.append({'field': 'tags', 'label': '标签',
-                        'from': '', 'to': '、'.join(names) or '（清空）'})
-        after['tag_ids'] = ids
-        after['tag_names'] = names
+    if (args.get('tags') is not None or args.get('add_tags')
+            or args.get('remove_tags')):
+        cur = [r['name'] for r in _fetch(
+            'SELECT t.name FROM entry_tags et JOIN tags t ON t.id=et.tag_id '
+            'WHERE et.entry_id=? ORDER BY t.id', (eid,))]
+        if args.get('tags') is not None:
+            target = _tag_names(args.get('tags'))
+        else:
+            target = list(cur)
+            for n in _tag_names(args.get('add_tags')):
+                if n not in target:
+                    target.append(n)
+            for n in _tag_names(args.get('remove_tags')):
+                target = [x for x in target if x != n]
+        if target != cur:
+            ids, names = resolve_tags(target)
+            changes.append({'field': 'tags', 'label': '标签',
+                            'from': '、'.join(cur) or '（无）',
+                            'to': '、'.join(target) or '（清空）'})
+            after['tag_ids'] = ids
+            after['tag_names'] = names
+        else:
+            tag_same, cur_tags = True, cur
     if not changes:
+        if tag_same:
+            return {'ok': True, 'no_change': True,
+                    'message': f'#{eid} 现在就是这些标签'
+                               f'（{"、".join(cur_tags) or "无"}），没有需要改的'}, []
         return {'error': '没看出要改什么。请给出至少一个要变更的字段'}, []
 
     item = {'entry_id': eid, 'date': row['date'],
@@ -1465,7 +1499,12 @@ DEFS = [
             'direction': {'type': 'string', 'enum': ['in', 'out']},
             'pending': {'type': 'boolean'},
             'tags': {'type': 'array', 'items': {'type': 'string'},
-                     'description': '完整替换标签；传空数组表示清空'},
+                     'description': '完整替换标签；传空数组表示清空。只想加/删某个标签时'
+                                    '用 add_tags / remove_tags，别用这个'},
+            'add_tags': {'type': 'array', 'items': {'type': 'string'},
+                         'description': '追加标签（保留原有标签），标签不存在会自动新建'},
+            'remove_tags': {'type': 'array', 'items': {'type': 'string'},
+                            'description': '去掉指定标签，其余保留'},
         }, 'required': []}}},
     {'type': 'function', 'function': {
         'name': 'propose_delete_entries',

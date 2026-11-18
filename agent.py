@@ -187,6 +187,31 @@ def t_list_accounts(args):
     return {'accounts': out, 'count': len(out)}, links
 
 
+def _kw_terms(raw):
+    """keyword 允许字符串或字符串数组；多个词之间是「同时满足」。"""
+    if isinstance(raw, (list, tuple)):
+        items = raw
+    else:
+        items = str(raw or '').replace('，', ',').replace('、', ',').split(',')
+    out = []
+    for x in items:
+        s = str(x or '').strip()
+        if s and s not in out:
+            out.append(s)
+    return out[:6]
+
+
+def _kw_sql(term):
+    """一个关键词的匹配条件：摘要/票号/对方/项目/备注 + 组合分录的小明细（共 8 个占位符）。"""
+    return ('(e.description LIKE ? OR e.check_no LIKE ? OR e.party LIKE ?'
+            ' OR e.project LIKE ? OR e.note LIKE ? OR e.id IN ('
+            'SELECT entry_id FROM entry_items WHERE description LIKE ?'
+            ' OR party LIKE ? OR note LIKE ?))')
+
+
+KW_SLOTS = 8      # _kw_sql 里的占位符个数，改 SQL 必须同步改这里
+
+
 def t_query_entries(args):
     cond, p = [], []
     if args.get('account_id'):
@@ -195,17 +220,18 @@ def t_query_entries(args):
     if args.get('company_id'):
         cond.append('a.company_id=?')
         p.append(int(args['company_id']))
+    # 日期条件单独放：命中 0 笔时要能在「去掉日期」后重试一次
+    cond_d, p_d = [], []
     if args.get('date_from'):
-        cond.append('e.date>=?')
-        p.append(str(args['date_from']))
+        cond_d.append('e.date>=?')
+        p_d.append(str(args['date_from']))
     if args.get('date_to'):
-        cond.append('e.date<=?')
-        p.append(str(args['date_to']))
-    kw = str(args.get('keyword') or '').strip()
-    if kw:
-        cond.append('(e.description LIKE ? OR e.check_no LIKE ? OR e.party LIKE ?'
-                    ' OR e.project LIKE ? OR e.note LIKE ?)')
-        p += [f'%{kw}%'] * 5
+        cond_d.append('e.date<=?')
+        p_d.append(str(args['date_to']))
+    terms = _kw_terms(args.get('keyword'))
+    for t in terms:
+        cond.append(_kw_sql(t))
+        p += [f'%{t}%'] * KW_SLOTS
     if args.get('party'):
         cond.append('e.party LIKE ?')
         p.append(f"%{args['party']}%")
@@ -229,17 +255,53 @@ def t_query_entries(args):
         cond.append('e.pending=1')
     elif status in ('booked', 'cleared', '已入账', '已兑现'):
         cond.append('e.pending=0')
-    where = ('WHERE ' + ' AND '.join(cond)) if cond else ''
+    # base_loose：不含日期条件的部分（自愈时复用）；base：完整条件
+    where_loose = ('WHERE ' + ' AND '.join(cond)) if cond else ''
+    base_loose = (f'FROM entries e JOIN accounts a ON a.id=e.account_id '
+                  f'JOIN companies c ON c.id=a.company_id {where_loose}')
+    cond_all, p_all = cond + cond_d, p + p_d
+    where = ('WHERE ' + ' AND '.join(cond_all)) if cond_all else ''
     base = (f'FROM entries e JOIN accounts a ON a.id=e.account_id '
             f'JOIN companies c ON c.id=a.company_id {where}')
     agg = one(f'SELECT COUNT(*) n, SUM(e.debit) d, SUM(e.credit) c, '
-              f'MIN(e.date) mn, MAX(e.date) mx {base}', p) or {}
+              f'MIN(e.date) mn, MAX(e.date) mx {base}', p_all) or {}
     limit = int(args.get('limit') or 30)
     limit = max(1, min(limit, MAX_ROWS))
     order = 'ASC' if str(args.get('order') or '').lower() == 'asc' else 'DESC'
     rr = rows(f'SELECT e.*, a.name account_name, a.currency, '
               f'c.name company_name {base} '
-              f'ORDER BY e.date {order}, e.id {order} LIMIT {limit}', p)
+              f'ORDER BY e.date {order}, e.id {order} LIMIT {limit}', p_all)
+
+    # ---- 自愈：按记账日期一条都没命中时，别急着回「没有」，先把日期放开再试 ----
+    # 真实场景：11 月付 10 月工资，摘要写「10月薪金」但 date 是 11-16，
+    # 用户说「查10月薪资」→ 只按 date 过滤必然 0 笔。这里自动按关键词在
+    # 全部日期里捞一遍，并把去掉日期后的结果直接返回，模型一次就能答对。
+    hint, fallback = '', None
+    if not rr and cond_d:
+        scope = one(f'SELECT COUNT(*) n, MIN(e.date) mn, MAX(e.date) mx '
+                    f'{base_loose}', p) or {}
+        date_seg = f"{args.get('date_from') or '最早'}~{args.get('date_to') or '现在'}"
+        if (terms or args.get('party') or args.get('project')):
+            loose = one(f'SELECT COUNT(*) n, SUM(e.debit) d, SUM(e.credit) c, '
+                        f'MIN(e.date) mn, MAX(e.date) mx {base_loose}', p) or {}
+            if (loose.get('n') or 0) > 0:
+                rr = rows(f'SELECT e.*, a.name account_name, a.currency, '
+                          f'c.name company_name {base_loose} '
+                          f'ORDER BY e.date {order}, e.id {order} LIMIT {limit}', p)
+                agg = loose
+                fallback = 'keyword_all_dates'
+                hint = (f'按记账日期 {date_seg} 没有命中，但同样的筛选条件'
+                        f'（去掉日期）在全部日期里有 {loose.get("n")} 笔，'
+                        f'区间 {loose.get("mn")}~{loose.get("mx")}，已返回这些记录。'
+                        f'记账日期是银行流水日期，摘要里的「10月」「9月工资」才是业务期间，'
+                        f'两者常差一个月。请按业务期间说明口径；'
+                        f'不要回答「没有记录」。')
+        if not hint:
+            hint = (f'按记账日期 {date_seg} 没有命中。'
+                    f'当前筛选范围（同样去掉日期）共有 {scope.get("n") or 0} 笔，'
+                    f'记账日期区间 {scope.get("mn")}~{scope.get("mx")}。'
+                    f'若要按业务期间找，请改用 keyword（如「10月」「薪金」）且不要带日期条件。')
+
     links, out = [], []
     for r in rr:
         target = f"entry:{r['id']}:{r['account_id']}"
@@ -263,14 +325,19 @@ def t_query_entries(args):
                          f" · {amt} {r['currency']} · {kind}",
                 'target': target,
             })
-    return {
+    res = {
         'total': agg.get('n') or 0,
         'sum_in': money(agg.get('d')),
         'sum_out': money(agg.get('c')),
         'net': money((agg.get('d') or 0) - (agg.get('c') or 0)),
         'date_min': agg.get('mn'), 'date_max': agg.get('mx'),
         'returned': len(out), 'entries': out,
-    }, links
+    }
+    if hint:
+        res['hint'] = hint
+    if fallback:
+        res['date_filter_ignored'] = True
+    return res, links
 
 
 def t_account_balance(args):
@@ -449,14 +516,15 @@ def t_aggregate_entries(args):
     if not expr:
         return {'error': f'group_by 只支持 {list(_AGG_GROUP)}'}, []
     cond, p = [], []
+    cond_d, p_d = [], []
 
     # 起始用 >=、结束用 <=（原来两个都写成 >=，带 date_to 时永远查不到数据）
     if args.get('date_from'):
-        cond.append('e.date>=?')
-        p.append(str(args['date_from']))
+        cond_d.append('e.date>=?')
+        p_d.append(str(args['date_from']))
     if args.get('date_to'):
-        cond.append('e.date<=?')
-        p.append(str(args['date_to']))
+        cond_d.append('e.date<=?')
+        p_d.append(str(args['date_to']))
     if args.get('company_id'):
         cond.append('a.company_id=?')
         p.append(int(args['company_id']))
@@ -466,10 +534,12 @@ def t_aggregate_entries(args):
     if args.get('currency'):
         cond.append('a.currency=?')
         p.append(str(args['currency']))
-    kw = str(args.get('keyword') or '').strip()
-    if kw:
-        cond.append('(e.description LIKE ? OR e.party LIKE ? OR e.project LIKE ?)')
-        p += [f'%{kw}%'] * 3
+    terms = _kw_terms(args.get('keyword'))
+    for t in terms:
+        cond.append('(e.description LIKE ? OR e.party LIKE ? OR e.project LIKE ?'
+                    ' OR e.note LIKE ? OR e.id IN (SELECT entry_id FROM entry_items'
+                    ' WHERE description LIKE ? OR party LIKE ?))')
+        p += [f'%{t}%'] * 6
     direction = str(args.get('direction') or '').lower()
     if direction in ('in', 'income', '收', '收入'):
         cond.append('e.debit>0')
@@ -477,17 +547,31 @@ def t_aggregate_entries(args):
         cond.append('e.credit>0')
     if str(args.get('status') or '').lower() in ('pending', 'uncleared', '未兑现'):
         cond.append('e.pending=1')
-    where = ('WHERE ' + ' AND '.join(cond)) if cond else ''
+    cond_all, p_all = cond + cond_d, p + p_d
+    where = ('WHERE ' + ' AND '.join(cond_all)) if cond_all else ''
+    where_loose = ('WHERE ' + ' AND '.join(cond)) if cond else ''
     limit = max(1, min(int(args.get('limit') or 20), 60))
-    rr = rows(f'SELECT {expr} k, COUNT(*) n, SUM(e.debit) d, SUM(e.credit) c '
-              f'FROM entries e JOIN accounts a ON a.id=e.account_id '
-              f'JOIN companies c ON c.id=a.company_id {where} '
-              f'GROUP BY k ORDER BY (SUM(e.debit)-SUM(e.credit)) '
-              f'{"DESC" if str(args.get("order") or "desc").lower()!="asc" else "ASC"} '
-              f'LIMIT {limit}', p)
-    tot = one(f'SELECT SUM(e.debit) d, SUM(e.credit) c, COUNT(*) n FROM entries e '
-              f'JOIN accounts a ON a.id=e.account_id JOIN companies c ON c.id=a.company_id '
-              f'{where}', p) or {}
+    sql_group = (f'SELECT {expr} k, COUNT(*) n, SUM(e.debit) d, SUM(e.credit) c '
+                 f'FROM entries e JOIN accounts a ON a.id=e.account_id '
+                 f'JOIN companies c ON c.id=a.company_id {{W}} '
+                 f'GROUP BY k ORDER BY (SUM(e.debit)-SUM(e.credit)) '
+                 f'{"DESC" if str(args.get("order") or "desc").lower()!="asc" else "ASC"} '
+                 f'LIMIT {limit}')
+    sql_tot = (f'SELECT SUM(e.debit) d, SUM(e.credit) c, COUNT(*) n FROM entries e '
+               f'JOIN accounts a ON a.id=e.account_id '
+               f'JOIN companies c ON c.id=a.company_id {{W}}')
+    rr = rows(sql_group.format(W=where), p_all)
+    tot = one(sql_tot.format(W=where), p_all) or {}
+    hint = ''
+    if (tot.get('n') or 0) == 0 and cond_d and (terms or args.get('currency')):
+        # 同样的「10 月薪资记在 11 月」问题：放开日期再算一遍
+        loose = one(sql_tot.format(W=where_loose), p) or {}
+        if (loose.get('n') or 0) > 0:
+            rr = rows(sql_group.format(W=where_loose), p)
+            tot = loose
+            hint = ('按记账日期没有命中，已放开日期条件（关键词命中优先）。'
+                    '记账日期是银行流水日期，摘要里的月份才是业务期间，'
+                    '回答时请说明这个口径。')
     base_in, base_out = float(tot.get('d') or 0), float(tot.get('c') or 0)
     out = []
     for r in rr:
@@ -499,9 +583,13 @@ def t_aggregate_entries(args):
             'share_out': round(cout / base_out * 100, 2) if base_out else 0,
             'share_in': round(din / base_in * 100, 2) if base_in else 0,
         })
-    return {'group_by': gb, 'rows': out, 'returned': len(out),
-            'total': {'count': tot.get('n') or 0, 'in': money(base_in),
-                      'out': money(base_out), 'net': money(base_in - base_out)}}, []
+    res = {'group_by': gb, 'rows': out, 'returned': len(out),
+           'total': {'count': tot.get('n') or 0, 'in': money(base_in),
+                     'out': money(base_out), 'net': money(base_in - base_out)}}
+    if hint:
+        res['hint'] = hint
+        res['date_filter_ignored'] = True
+    return res, []
 
 
 def t_compare_periods(args):
@@ -582,13 +670,22 @@ TOOLS = [
         'name': 'query_entries',
         'description': '查询日记账流水。支持按公司/账户/日期区间/关键词/对方单位/'
                        '项目/标签/收支方向/金额下限/兑现状态过滤，自动排序并返回合计。'
-                       '这是最常用的工具。',
+                       '这是最常用的工具。注意 date_from/date_to 过滤的是**记账日期**'
+                       '（银行流水日期），不是「业务所属月份」：11 月付的 10 月工资，'
+                       'date 是 11 月某天、摘要里写「10月薪金」。用户说「10月薪资」这类'
+                       '按业务期间的说法时，优先用 keyword 搜摘要，别硬套日期区间；'
+                       '若按日期查成 0 笔，工具会自动放开日期重查并在 hint 里说明。',
         'parameters': {'type': 'object', 'properties': {
             'company_id': {'type': 'integer'},
             'account_id': {'type': 'integer'},
-            'date_from': {'type': 'string', 'description': 'YYYY-MM-DD'},
-            'date_to': {'type': 'string', 'description': 'YYYY-MM-DD'},
-            'keyword': {'type': 'string', 'description': '摘要/单据号/对方/项目/备注 模糊匹配'},
+            'date_from': {'type': 'string',
+                          'description': 'YYYY-MM-DD，按记账日期（流水日期）过滤'},
+            'date_to': {'type': 'string',
+                        'description': 'YYYY-MM-DD，按记账日期（流水日期）过滤'},
+            'keyword': {'type': 'string',
+                        'description': '摘要/票号/对方/项目/备注/小明细 模糊匹配。'
+                                       '多个词用逗号分隔表示同时满足，'
+                                       '如「10月,薪」'},
             'party': {'type': 'string', 'description': '对方单位模糊匹配'},
             'project': {'type': 'string', 'description': '项目模糊匹配'},
             'tag': {'type': 'string', 'description': '标签名模糊匹配'},

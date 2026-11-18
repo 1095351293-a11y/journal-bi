@@ -53,7 +53,10 @@ const accRate  = a  => rateOf(a.currency);
 /* ============ 弹窗 ============ */
 const overlay = $('#modalOverlay'), modalBox = $('#modalBox');
 function openModal(html){ modalBox.innerHTML = html; overlay.classList.remove('hidden'); }
-function closeModal(){ overlay.classList.add('hidden'); modalBox.innerHTML=''; modalBox.style.width=''; }
+function closeModal(){
+  overlay.classList.add('hidden'); modalBox.innerHTML=''; modalBox.style.width='';
+  if(pendingRefresh){ pendingRefresh = false; setTimeout(()=>{ refreshAfterWrite(); }, 0); }
+}
 overlay.addEventListener('mousedown', e=>{ if(e.target===overlay) closeModal(); });
 document.addEventListener('keydown', e=>{
   if(e.altKey && !e.ctrlKey && (e.key === 'a' || e.key === 'A')){
@@ -71,6 +74,8 @@ const TITLES = {dashboard:'总览看板', journal:'日记账', cash:'现金管�
                 deposits:'定期存款', tags:'标签管理', orgs:'公司与账户',
                 settings:'设置'};
 const VIEW_KEY = 'jb.view', CO_KEY = 'jb.company', JR_KEY = 'jb.jr';
+const REM_POP_KEY = 'jb.remPopped';   // 本次会话是否已自动弹过提醒
+const CASH_KEY = 'jb.cashDate';
 /* 刷新后停在原页面：视图 + 公司 + 日记账筛选条件 */
 function viewStateSave(){
   try{ localStorage.setItem(CO_KEY, String(S.company ?? '')); }catch(e){}
@@ -80,6 +85,7 @@ function viewStateSave(){
       accId:j.accId, from:j.from, to:j.to, preset:j.preset,
       q:j.q, status:j.status, tagId:j.tagId}));
   }catch(e){}
+  try{ sessionStorage.setItem(CASH_KEY, cashDate || ''); }catch(e){}
 }
 /* 侧栏「当前公司」下拉：第一项是全部公司 */
 function paintCompanySelect(){
@@ -100,6 +106,10 @@ function viewStateRestore(){
     const j = JSON.parse(sessionStorage.getItem(JR_KEY) || 'null');
     if(j && typeof j === 'object') Object.assign(S.jr, j, {loaded:false});
   }catch(e){}
+  try{
+    const d = sessionStorage.getItem(CASH_KEY);
+    if(d) cashDate = d;
+  }catch(e){}
 }
 function switchView(v, opt){
   S.view = v;
@@ -110,16 +120,31 @@ function switchView(v, opt){
     try{ history.replaceState(null, '', '#'+v); }catch(e){ location.hash = v; }
   }
   viewStateSave();
-  ({dashboard:renderDashboard, journal:renderJournal, cash:renderCash,
+  return ({dashboard:renderDashboard, journal:renderJournal, cash:renderCash,
     deposits:renderDeposits, tags:renderTags, orgs:renderOrgs,
     settings:renderSettings})[v]();
 }
 /* 账本被改过：把带缓存的数据丢掉再重画当前页 */
-function invalidateCaches(){ S.jr.loaded = false; }
+function invalidateCaches(){ S.jr.loaded = false; S.loadedAt = 0; }
+/* 重画当前页但不打扰人：页面不变、筛选条件不变、表格滚动位置不变；
+   有弹窗开着就先记下来，等弹窗关了再画（否则会把人正在填的表单冲掉） */
+let pendingRefresh = false;
 async function refreshAfterWrite(){
+  if(!overlay.classList.contains('hidden')){ pendingRefresh = true; return; }
+  pendingRefresh = false;
+  const wrap0 = $('#content .tbl-wrap');
+  const scTop = wrap0 ? wrap0.scrollTop : 0;
+  const winTop = window.scrollY || document.documentElement.scrollTop || 0;
   await refreshBootstrap();
   invalidateCaches();
   try{ await switchView(S.view, {nohash:true}); }catch(e){}
+  const restore = ()=>{
+    const wrap1 = $('#content .tbl-wrap');
+    if(wrap1 && scTop) wrap1.scrollTop = scTop;
+    if(winTop) window.scrollTo(0, winTop);
+  };
+  restore();
+  requestAnimationFrame(()=>{ if(pendingRefresh===false) restore(); });
 }
 
 /* ============ 启动 ============ */
@@ -133,9 +158,16 @@ async function boot(){
   const hash = (location.hash || '').replace('#', '');
   const last = (()=>{ try{ return localStorage.getItem(VIEW_KEY) || ''; }catch(e){ return ''; } })();
   const init = TITLES[hash] ? hash : (TITLES[last] ? last : 'dashboard');
-  switchView(init);
+  await switchView(init);
   await loadReminders();
-  if(activeReminders().length && overlay.classList.contains('hidden')) openReminderModal();
+  // 待办提醒只在本次会话第一次打开时自动弹一次；之后按 F5 / 自动刷新都不再弹，
+  // 要看就点侧栏的提醒按钮（角标上仍有数量）
+  let popped = '';
+  try{ popped = sessionStorage.getItem(REM_POP_KEY) || ''; }catch(e){}
+  if(activeReminders().length && !popped && overlay.classList.contains('hidden')){
+    try{ sessionStorage.setItem(REM_POP_KEY, '1'); }catch(e){}
+    openReminderModal();
+  }
 }
 
 /* ============ 标签/备注 待办提醒（侧栏按钮 + 弹窗） ============ */
@@ -1245,7 +1277,7 @@ async function renderJournal(){
   Object.keys(jrFold).forEach(sec=>{ if(jrFold[sec]) toggleJrSec(sec); });
 
   $('#jrQ').addEventListener('input', debounce(e=>{
-    S.jr.q = e.target.value; renderJournalKeepFocus();
+    S.jr.q = e.target.value; viewStateSave(); renderJournalKeepFocus();
   }, 300));
 }
 
@@ -3144,6 +3176,16 @@ function agSchedulePaint(m){
     if(atBottom) sc.scrollTop = sc.scrollHeight;
   });
 }
+/* 账本被 AI 改过：稍等一下再重画当前页（一轮里可能连改多笔，别每笔都重画） */
+let agRefreshTimer = 0;
+function agScheduleRefresh(){
+  clearTimeout(agRefreshTimer);
+  agRefreshTimer = setTimeout(()=>{
+    agRefreshTimer = 0;
+    if(!S.agent.msgs) return;
+    try{ refreshAfterWrite(); }catch(e){}
+  }, 500);
+}
 function agentOnEvent(m, ev){
   switch(ev.t){
     case 'start': m.model = ev.model; m.vision = !!ev.vision; break;
@@ -3186,6 +3228,10 @@ function agentOnEvent(m, ev){
       }
       break;
     case 'usage': m.usage = ev.usage || null; break;
+    case 'refresh':
+      // 直写权限下没有草稿卡可点，后端写完发这个事件让我们重画账页
+      agScheduleRefresh();
+      break;
     case 'done':
       m.ms = ev.ms; m.turns = ev.turns; m.model = ev.model || m.model; break;
     case 'error':
@@ -4109,17 +4155,17 @@ document.addEventListener('change', async e=>{
   const act = el.dataset.change;
   if(act==='jr-acc'){
     S.jr={accId:+el.value,account:null,entries:[],loaded:false,from:'',to:'',preset:'thisMonth',q:'',status:'',tagId:''};
-    renderJournal();
+    viewStateSave(); renderJournal();
   }
   else if(act==='jr-preset'){
     S.jr.preset=el.value;
     if(el.value!=='custom') [S.jr.from,S.jr.to]=presetRange(el.value);
-    renderJournal();
+    viewStateSave(); renderJournal();
   }
-  else if(act==='jr-from'){ S.jr.from=el.value; S.jr.preset='custom'; renderJournal(); }
-  else if(act==='jr-to'){ S.jr.to=el.value; S.jr.preset='custom'; renderJournal(); }
-  else if(act==='jr-tag'){ S.jr.tagId=el.value; renderJournal(); }
-  else if(act==='cash-date'){ cashDate = el.value; renderCash(); }
+  else if(act==='jr-from'){ S.jr.from=el.value; S.jr.preset='custom'; viewStateSave(); renderJournal(); }
+  else if(act==='jr-to'){ S.jr.to=el.value; S.jr.preset='custom'; viewStateSave(); renderJournal(); }
+  else if(act==='jr-tag'){ S.jr.tagId=el.value; viewStateSave(); renderJournal(); }
+  else if(act==='cash-date'){ cashDate = el.value; viewStateSave(); renderCash(); }
   else if(act==='jr-pend-check'){ recalcJournalPend(); }
   else if(act==='jr-pick'){
     const sid = +el.dataset.id;

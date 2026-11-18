@@ -33,6 +33,9 @@ SESS_TTL = 30 * 60          # 30 分钟内查过的数据可以直接复用
 SESS_MAX = 200
 FACTS_IN_PROMPT = 8          # 最多注入 8 条已知事实
 LINK_TOTAL = 6
+# 这些工具只出草稿，真正落库要等用户点确认；没 auto 就不算「账本被改过」
+DRAFT_ONLY = {'propose_entry', 'propose_update_entry', 'propose_delete_entries',
+              'propose_merge_entries', 'propose_import', 'import_file'}
 
 
 # ---------------------------------------------------------------- 意图路由
@@ -58,6 +61,11 @@ _RE_WRITE = re.compile(
     r'录一笔|做一笔|开一笔|这笔补|登记一下|'
     r'改成|改为|修改|调整成|更新一下这|把.{0,12}(摘要|备注|对方|项目|金额|日期|标签)'
     r'.{0,6}(改|换|调)|打标签|加标签|标记为|标一下|'
+    # 标签类动作：加/挂/贴/打/去/删/清 —— 「也加上『已核对』」这种说法必须挂写工具
+    r'(加|挂|贴|打|标|设)(个|上|一个|一下)?(标签|标记)|标签.{0,8}(加|挂|贴|打|去|删|清|换)|'
+    r'(去掉|删掉|清除|清空|取消).{0,8}(标签|标记)|'
+    r'(也|再|都|全部|另外).{0,6}(加上|加个|挂上|贴上|标上|打上|去掉|删掉)|'
+    r'合并|合成一笔|并成一笔|加起来记|归成一笔|'
     r'删掉|删除|去掉这|移除这|作废这|重复了|'
     r'导入|批量加|批量录|把.{0,10}(对账单|账单|表).{0,6}(导入|录|记)|'
     # 对着上一张草稿提意见、要求重来：这些说法同样要挂写工具
@@ -176,10 +184,17 @@ def sess_add_fact(sid, key, label, digest, payload=None):
     d = sess_get(sid)
     d['facts'][key] = {'label': label, 'digest': digest,
                        'payload': (payload or '')[:6000],
+                       'abs': time.time(),
                        'ts': datetime.now().strftime('%H:%M')}
     if len(d['facts']) > 30:
         for k in list(d['facts'])[:-30]:
             d['facts'].pop(k, None)
+
+
+def sess_mark_dirty(sid):
+    """账本被改过：之前查到的数据可能过期，提示模型需要时重查。"""
+    d = sess_get(sid)
+    d['dirty'] = time.time()
 # ---------------------------------------------------------------- 模型能力
 _VISION_HINT = re.compile(
     r'(vl\b|vl-|vision|4o\b|4\.1|omni|claude|gemini|internvl|llava|minicpm-v|'
@@ -317,6 +332,13 @@ def facts_block(sid):
     lines.append('上面这些是本次对话已经查过的结果。问题能答就直接答，'
                  '并注明「依据 xx:xx 的查询」；确实缺数据时再调工具，'
                  '同条件不要重复查。')
+    dirty = d.get('dirty') or 0
+    stale = dirty and dirty > max((f.get('abs') or 0) for _k, f in facts)
+    if stale:
+        lines.append('')
+        lines.append('⚠️ 注意：上面这些查询之后账本又被改写过（新增/修改/删除/合并不等），'
+                     '涉及具体流水、标签、金额时以重新查询为准，不要拿旧清单断言'
+                     '「没有这笔」「余额是 X」。')
     return '\n'.join(lines)
 
 
@@ -610,15 +632,19 @@ def run_agent_stream(cfg, sid, history, text, atts=None, company_id=None):
 
         # 全权限：进入 agent 模式就挂上全部工具（查询 + 写入 + 系统维护），
         # 由模型按用户意图自选，不再按关键词裁剪工具面。
+        # context 模式（「把刚才那个整理成表格」这类）以前不给任何工具，
+        # 结果模型想补查一笔时无从下手、只能反问 —— 现在给只读工具兜底。
         tools = (pick_tools(None, True) if route['mode'] == 'agent'
-                 else pick_tools(route.get('tools'), False))
+                 else pick_tools(route.get('tools') or None, False))
         usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
         auto_links, pushed_links = [], []
         emitted_proposal = False
-        rounds = max(1, min(int(cfg.get('max_rounds') or 6), 12))
+        rounds = max(1, min(int(cfg.get('max_rounds') or 8), 14))
         reply = ''
         turns = 0
         last_text = ''
+        wrote = False
+        wrote_n = 0
 
         for turn in range(rounds):
             turns = turn + 1
@@ -702,22 +728,35 @@ def run_agent_stream(cfg, sid, history, text, atts=None, company_id=None):
                         continue
                     bucket.append({'label': str(l.get('label') or tgt)[:120],
                                    'target': tgt})
-                if ok and name not in ('show_links',):
+                if ok and name not in WRITE_NAMES and name != 'show_links':
                     key = name + '|' + json.dumps(cargs, sort_keys=True,
                                                   ensure_ascii=False)[:200]
                     sess_add_fact(sid, key, TOOL_LABEL.get(name, name), summary,
                                   json.dumps(result, ensure_ascii=False)[:4000])
+                if ok and name in WRITE_NAMES:
+                    # 写成功了才刷新/标脏：只出草稿（等用户点确认）的先不算
+                    if name not in DRAFT_ONLY or result.get('auto'):
+                        wrote = True
+                        wrote_n += 1
+                        sess_mark_dirty(sid)
                 messages.append({'role': 'tool', 'tool_call_id': cid,
                                  'content': json.dumps(result, ensure_ascii=False)[:16000]})
         else:
             if not reply:
-                reply = last_text or ('已经查了几轮还没收敛，把问题拆小一点会更快，'
-                                      '比如先问「有哪些账户」，再问具体那个账户的流水。')
+                if wrote:
+                    reply = (f'这一轮已经写入 {wrote_n} 笔（明细见上方的工具记录）。'
+                             f'要接着处理剩下的，说一句「继续」就行。')
+                else:
+                    reply = last_text or ('已经查了几轮还没收敛，把问题拆小一点会更快，'
+                                          '比如先问「有哪些账户」，再问具体那个账户的流水。')
                 yield {'t': 'text', 'd': reply}
 
         if not reply:
             reply = '（模型没有返回内容，可以点重新生成或换个模型试试）'
             yield {'t': 'text', 'd': reply}
+        if wrote:
+            # 直写（auto 权限）时前端没有草稿卡可点，靠这个事件重画账页
+            yield {'t': 'refresh', 'scope': 'all'}
         inline = bool(re.search(r'\]\(#[A-Za-z]+:', reply))
         shown = [] if inline else (pushed_links or auto_links)
         if shown:
