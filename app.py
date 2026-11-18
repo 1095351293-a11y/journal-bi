@@ -572,6 +572,107 @@ def clear_entry_marks(eid):
     return jsonify({'ok': True})
 
 
+def merge_entries_db(db, ids, date_v='', desc_v=''):
+    """把 ids 里的几笔合成一笔（供界面和 AI 共用）。
+
+    返回 (新分录 id, 被合并的原始快照列表)；出错抛 ValueError。
+    快照用于撤销：恢复原几笔、删掉新这一笔。
+    """
+    clean = []
+    for x in ids:
+        try:
+            clean.append(int(x))
+        except (TypeError, ValueError):
+            pass
+    ids = list(dict.fromkeys(clean))
+    if len(ids) < 2:
+        raise ValueError('至少要选 2 笔才能合并')
+    ph = ','.join('?' * len(ids))
+    rows = db.execute(f'SELECT * FROM entries WHERE id IN ({ph}) ORDER BY date, id',
+                      ids).fetchall()
+    if len(rows) != len(ids):
+        raise ValueError('有流水已不存在，请刷新后再试')
+    if len({r['account_id'] for r in rows}) > 1:
+        raise ValueError('跨账户的流水不能合并，请只选同一账户的')
+    if len({1 if r['debit'] else 0 for r in rows}) > 1:
+        raise ValueError('收入与支出不能合成一笔，请分两次合并')
+    is_in = bool(rows[0]['debit'])
+
+    # 明细：原有明细的流水先展开，避免层级被压掉
+    sub = entry_items_map(db, ids)
+    items = []
+    for r in rows:
+        its = sub.get(r['id']) or []
+        if len(its) >= 2:
+            for it in its:
+                items.append({'description': it['description'], 'party': it['party'],
+                              'amount': it['amount'], 'note': it['note']})
+        else:
+            amt = r['debit'] or r['credit']
+            if amt:
+                items.append({'description': r['description'], 'party': r['party'],
+                              'amount': amt, 'note': r['note']})
+    if len(items) < 2:
+        raise ValueError('这些流水金额都是 0，没有可合并的内容')
+    total = round(sum(float(it['amount']) for it in items), 2)
+
+    date_v = (date_v or '').strip()
+    if date_v and not DATE_RE.match(date_v):
+        raise ValueError('日期格式应为 YYYY-MM-DD')
+    date_v = date_v or rows[0]['date']
+    desc_v = (desc_v or '').strip() or rows[0]['description'] or f'合并 {len(rows)} 笔'
+    same = lambda k: rows[0][k] if len({(r[k] or '') for r in rows}) == 1 else ''
+    tag_ids = {r['tag_id'] for r in db.execute(
+        f'SELECT tag_id FROM entry_tags WHERE entry_id IN ({ph})', ids).fetchall()}
+    tags_map = entry_tags_map(db, ids)
+
+    # 撤销快照：原几笔的整行 + 标签 + 明细
+    snapshot = []
+    for r in rows:
+        snapshot.append({'row': rowdict(r),
+                         'tags': [t['id'] for t in tags_map.get(r['id'], [])],
+                         'items': sub.get(r['id'], [])})
+
+    cur = db.execute(
+        'INSERT INTO entries(account_id,date,check_no,description,party,'
+        'debit,credit,pending,project,note,created_at) '
+        'VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+        (rows[0]['account_id'], date_v, same('check_no'), desc_v, '',
+         total if is_in else 0, 0 if is_in else total,
+         1 if all(r['pending'] for r in rows) else 0,
+         same('project'), '', now_iso()))
+    nid = cur.lastrowid
+    sync_entry_items(db, nid, items)
+    set_entry_tags(db, nid, tag_ids)
+    # 原流水的附件改挂到合并后的这一笔，凭证不丢
+    db.execute(f'UPDATE attachments SET entry_id=? WHERE entry_id IN ({ph})',
+               [nid] + ids)
+    db.execute(f'DELETE FROM entry_items WHERE entry_id IN ({ph})', ids)
+    db.execute(f'DELETE FROM entry_tags WHERE entry_id IN ({ph})', ids)
+    db.execute(f'DELETE FROM entries WHERE id IN ({ph})', ids)
+    return nid, snapshot
+
+
+@app.post('/api/entries/merge')
+def merge_entries():
+    """把选中的几笔合成一笔：合计金额记在父记录，每笔原样变成一条小明细。
+    要求同一账户、同一方向（全收或全支）—— 混方向请分两次合并。
+    原流水删除，其附件改挂到合并后的这一笔；已有明细的流水会展开后一起并入。"""
+    data = request.get_json(force=True)
+    db = get_db()
+    with _write_lock:
+        try:
+            nid, snap = merge_entries_db(db, data.get('entry_ids') or [],
+                                         data.get('date'), data.get('description'))
+        except ValueError as exc:
+            db.rollback()
+            return bad(str(exc))
+        db.commit()
+    row = db.execute('SELECT * FROM entries WHERE id=?', (nid,)).fetchone()
+    return jsonify({'ok': True, 'merged': len(snap),
+                    'entry': serialize_entries(db, [row])[0]})
+
+
 @app.delete('/api/entries/<int:eid>')
 def del_entry(eid):
     db = get_db()

@@ -32,6 +32,9 @@ let jrGroupMonth = false;
 let jrFold = { booked:false, pend:false };
 /* 组合分录：哪些父行的明细已在表格里展开 */
 let jrOpenItems = new Set();
+/* 多选合并：选择模式 + 已勾选的流水 id */
+let jrSelectMode = false;
+let jrSelected = new Set();
 /* 「全部公司」：S.company 为字符串 'all'，其余情况仍是公司 id 数字 */
 const isAllCo  = () => S.company === 'all';
 const coAccs   = () => isAllCo() ? S.accounts : S.accounts.filter(a=>a.company_id===S.company);
@@ -1188,8 +1191,13 @@ async function renderJournal(){
     <span class="sep"></span>
     <a class="btn" href="/api/export/excel?type=journal&account_id=${S.jr.accId}&from=${S.jr.from}&to=${S.jr.to}&tag_id=${S.jr.tagId||''}&q=${encodeURIComponent(S.jr.q)}&group=${jrGroupMonth&&canGroup?1:0}">📥 导出Excel</a>
     <button class="btn" data-action="planner" data-id="${S.jr.accId}">🧮 资金规划</button>
+    ${jrSelectMode
+      ? `<button class="btn primary" data-action="jr-merge"${jrSelected.size<2?' disabled':''}>🔗 合并选中${jrSelected.size?`（${jrSelected.size} 笔）`:''}</button>
+         <button class="btn" data-action="jr-select" data-on="0">取消多选</button>`
+      : `<button class="btn" data-action="jr-select" data-on="1" title="勾选几笔合成一笔：合计记一笔，每笔变成小明细">🔗 多选合并</button>`}
     <button class="btn primary" data-action="entry-add">＋ 新增流水</button>
   </div>
+  ${jrSelectMode?`<div class="hint mb pick-bar">🔗 <b>多选合并</b>：勾选同一个账户、同一方向（都是收入或都是支出）的几笔，点「合并选中」。合并后账上只留一笔合计金额，每笔原样成为小明细，<b>导出时按小笔逐行展开</b>。已选 <b>${jrSelected.size}</b> 笔${jrSelTip()}</div>`:''}
   <div class="hint mb">按日期自动排序；表格分两段——<b>已入账</b>在上、<b>未兑现/未到账</b>在下。已入账段的余额与期初期末均为实际余额（不含未兑现/未到账款项）；<b>下方待兑付段固定列出该账户全部月份的未兑现/未到账</b>，不随日期范围收窄（不在本期的会标「非本期」）；勾选支票/待到账，可实时看到扣除后的余额。</div>
   <div class="tbl-wrap">
     <table class="tbl" id="jrTable">
@@ -1246,9 +1254,13 @@ function journalRow(e, sec){
   const nItem = (e.items||[]).length;
   const combo = nItem > 1;
   const open = combo && jrOpenItems.has(e.id);
+  const picked = jrSelected.has(e.id);
+  const chkCell = jrSelectMode
+    ? `<input type="checkbox" data-change="jr-pick" data-id="${e.id}" ${picked?'checked':''} onclick="event.stopPropagation()">`
+    : (e.pending?`<input type="checkbox" data-change="jr-pend-check" data-id="${e.id}" onclick="event.stopPropagation()">`:'');
   return `
-    <tr class="${e.pending?'pendrow':''}${combo?' combo-row':''}" data-sec="${sec||(e.pending?'pend':'booked')}" data-action="entry-edit" data-id="${e.id}">
-      <td class="chk-cell">${e.pending?`<input type="checkbox" data-change="jr-pend-check" data-id="${e.id}" onclick="event.stopPropagation()">`:''}</td>
+    <tr class="${e.pending?'pendrow':''}${combo?' combo-row':''}${picked?' picked-row':''}" data-sec="${sec||(e.pending?'pend':'booked')}" data-action="${jrSelectMode?'jr-pick':'entry-edit'}" data-id="${e.id}">
+      <td class="chk-cell">${chkCell}</td>
       <td style="white-space:nowrap">${esc(e.date)}${outOfRange?'<span class="cur-chip" title="不在上方所选日期范围内">非本期</span>':''}</td>
       <td style="white-space:nowrap">${esc(e.check_no)}</td>
       <td class="desc-cell">${esc(e.description)}${combo?`<span class="item-badge" data-action="entry-items" data-id="${e.id}" title="这笔是多笔合记，点开看小明细">${open?'▾':'▸'} 🧩 ${nItem} 笔</span>`:''}${e.party?`<div class="party">对方：${esc(e.party)}</div>`:''}${e.project?`<div class="party">项目：${esc(e.project)}</div>`:''}</td>
@@ -1279,8 +1291,49 @@ function itemRows(e, sec){
     </tr>`).join('');
 }
 
-function recalcJournalPend(){
-  const cell = $('#jrPendBal'); if(!cell) return;
+/* 多选合并：已选笔数的合计与方向校验提示 */
+function jrSelTip(){
+  const sel = (S.jr.entries||[]).filter(e=>jrSelected.has(e.id));
+  if(!sel.length) return '';
+  const total = sel.reduce((s,e)=>s+(e.debit||e.credit||0),0);
+  const mixed = new Set(sel.map(e=>(e.debit?'in':'out'))).size > 1;
+  return `　合计 <b>${fmt(total)}</b>`
+    + (mixed?'　<span class="warn-txt">⚠️ 里面既有收入又有支出，不能合成一笔</span>':'');
+}
+
+/* 合并确认弹窗：合计金额 + 可改的日期/摘要，并列出将要变成明细的每一笔 */
+function openMergeModal(){
+  const sel = (S.jr.entries||[]).filter(e=>jrSelected.has(e.id));
+  if(sel.length < 2){ alert('至少要选 2 笔才能合并。'); return; }
+  if(new Set(sel.map(e=>(e.debit?'in':'out'))).size > 1){
+    alert('已选的流水里既有收入又有支出，不能合成一笔，请分两次合并。'); return;
+  }
+  const isIn = (sel[0].debit||0) > 0;
+  const total = sel.reduce((s,e)=>s+(e.debit||e.credit||0),0);
+  const earliest = sel.map(e=>e.date).sort()[0];
+  const acc = accById(sel[0].account_id) || S.jr.account;
+  openModal(modalHead('🔗 合并为一笔') + `
+    <div class="form-grid">
+      <div class="field"><label>日期</label><input class="inp" type="date" id="mgDate" value="${earliest}"></div>
+      <div class="field"><label>合计金额（${isIn?'收入':'支出'}）</label>
+        <input class="inp" value="${fmt(total)}${acc?' '+esc(acc.currency):''}" readonly style="background:#f8fafc;color:#475569"></div>
+      <div class="field full"><label>合并后的摘要</label>
+        <input class="inp" id="mgDesc" value="${esc(sel[0].description || ('合并 '+sel.length+' 笔'))}"></div>
+    </div>
+    <div class="hint" style="margin:12px 0 6px">将合并以下 <b>${sel.length}</b> 笔，每笔原样成为小明细：</div>
+    <div class="merge-list">${sel.map((e,i)=>`
+      <div class="merge-line"><span class="item-seq">${ITEM_MARK[i]||('('+(i+1)+')')}</span>
+        <span class="merge-desc">${esc(e.description||'(无摘要)')}</span>
+        <span class="muted small">${esc(e.date)}</span>
+        <b>${fmt(e.debit||e.credit)}</b></div>`).join('')}</div>
+    <div class="hint" style="margin-top:10px">原几笔会被删除，它们上传的凭证改挂到合并后的这一笔；导出 Excel 时按这 ${sel.length} 笔明细逐行展开，合计金额与合并前一致。</div>
+    <div class="modal-actions">
+      <button class="btn" data-action="modal-close">取消</button>
+      <button class="btn primary" data-action="mg-ok">确认合并</button>
+    </div>`);
+}
+
+function recalcJournalPend(){  const cell = $('#jrPendBal'); if(!cell) return;
   const base = parseFloat(cell.dataset.base) || 0;
   let inSum = 0, outSum = 0, n = 0;
   $$('#jrTable [data-change="jr-pend-check"]').forEach(cb=>{
@@ -2766,7 +2819,7 @@ function agentMsgHTML(m, idx){
 }
 /* ---- 写入草稿卡片 ---- */
 const AG_PROP_KIND = {create:'新增流水', import:'批量导入', update:'修改流水',
-                      delete:'删除流水'};
+                      delete:'删除流水', merge:'合并流水'};
 function agPropDir(it){
   return (it.debit || it.direction === 'in') ? 'in' : 'out';
 }
@@ -2775,7 +2828,8 @@ function agPropMoney(it){
 }
 function agPropItemsHTML(p, mi, pi){
   const items = p.items || [];
-  const ed = !!p.editing;
+  // 合并卡里的行是「原件」，不允许在卡片上改（要改去日记账里编辑原流水）
+  const ed = !!p.editing && p.kind !== 'merge';
   const cell = (k, it, i, cls, type) => {
     const v = k === 'amount' ? agPropMoney(it).toFixed(2) : (it[k] ?? '');
     return `<input class="ag-pe ${cls||''}" type="${type||'text'}"
@@ -3873,6 +3927,34 @@ document.addEventListener('click', async e=>{
         break;
       }
       case 'entry-add': tmpTags.clear(); openEntryModal(null); break;
+      case 'jr-select': {
+        jrSelectMode = el.dataset.on === '1';
+        jrSelected.clear();
+        renderJournal();
+        break;
+      }
+      case 'jr-pick': {
+        const sid = +el.dataset.id;
+        if(jrSelected.has(sid)) jrSelected.delete(sid); else jrSelected.add(sid);
+        renderJournal();
+        break;
+      }
+      case 'jr-merge': openMergeModal(); break;
+      case 'mg-ok': {
+        const ids = [...jrSelected];
+        try{
+          await jpost('/api/entries/merge', {
+            entry_ids: ids,
+            date: $('#mgDate').value,
+            description: ($('#mgDesc').value||'').trim(),
+          });
+          closeModal();
+          jrSelectMode = false; jrSelected.clear();
+          await reloadJournal();
+          loadReminders();
+        }catch(err){ alert(err.message); }
+        break;
+      }
       case 'entry-edit': if(e.target.closest('[data-action]').dataset.action==='entry-edit') openEntryModal(+el.dataset.id); break;
       case 'entry-att': e.stopPropagation(); openEntryModal(+el.dataset.id); break;
       case 'entry-items': {
@@ -4039,6 +4121,11 @@ document.addEventListener('change', async e=>{
   else if(act==='jr-tag'){ S.jr.tagId=el.value; renderJournal(); }
   else if(act==='cash-date'){ cashDate = el.value; renderCash(); }
   else if(act==='jr-pend-check'){ recalcJournalPend(); }
+  else if(act==='jr-pick'){
+    const sid = +el.dataset.id;
+    if(el.checked) jrSelected.add(sid); else jrSelected.delete(sid);
+    renderJournal();
+  }
   else if(act==='plan-check'){
     const acc=accById(S.jr.accId);
     const pend=S.jr.entries.filter(x=>x.pending);

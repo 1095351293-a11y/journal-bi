@@ -33,6 +33,7 @@ WRITE_LOG = os.path.join(DATA_DIR, 'agent_writes.jsonl')
 
 MAX_ITEMS = 200           # 单张草稿最多几行，防止一次刷爆
 MAX_DELETE = 20           # 单次删除上限
+MAX_MERGE = 30            # 单次合并上限
 BIG_AMOUNT = 1000000      # 超过这个金额提醒核对
 PROP_TTL = 6 * 3600       # 草稿 6 小时后作废
 
@@ -356,6 +357,21 @@ def dup_hits(account_id, d, debit, credit, exclude_id=None):
 
 
 # ---------------------------------------------------------------- 构造草稿
+def _norm_sub_items(raw):
+    """把模型给的 items 规范成 [{description, party, amount}]，只留金额 > 0 的。"""
+    out = []
+    for s in (raw or []):
+        if not isinstance(s, dict):
+            continue
+        a = abs(_num(s.get('amount')))
+        if a <= 0:
+            continue
+        out.append({'description': str(s.get('description') or '').strip(),
+                    'party': str(s.get('party') or '').strip(),
+                    'amount': round(a, 2)})
+    return out
+
+
 def _build_item(args, idx=0, default_year=None, force_account=None):
     """把模型给的字段规范成一条待写入流水，返回 (item, warning 列表, err)。"""
     warns = []
@@ -368,7 +384,13 @@ def _build_item(args, idx=0, default_year=None, force_account=None):
     if not d:
         return None, warns, (f'第 {idx + 1} 行日期认不出来：{args.get("date")!r}，'
                              f'请用 YYYY-MM-DD')
+    subs = _norm_sub_items(args.get('items'))
     amount = abs(_num(args.get('amount')))
+    if not amount and len(subs) >= 2:
+        # 只给了明细没给总额：按明细合计记账
+        amount = round(sum(x['amount'] for x in subs), 2)
+        warns.append(f'第 {idx + 1} 行按 {len(subs)} 笔明细合计 '
+                     f'{amount:,.2f} 记账，导出时会按小笔逐行展开')
     debit = abs(_num(args.get('debit')))
     credit = abs(_num(args.get('credit')))
     direction = str(args.get('direction') or '').strip().lower()
@@ -405,6 +427,8 @@ def _build_item(args, idx=0, default_year=None, force_account=None):
         'pending': 1 if args.get('pending') else 0,
         'tag_ids': tag_ids, 'tag_names': tag_names,
     }
+    if len(subs) >= 2:
+        item['items'] = subs
     for h in dup_hits(acc['id'], d, debit, credit):
         warns.append(f'疑似重复：{h["date"]} 已有 '
                      f'{h["debit"] or h["credit"]:,.2f} · {(h["description"] or "")[:24]}')
@@ -622,6 +646,67 @@ def w_propose_delete(args):
                    '提醒用户核对后勾选确认。'}
     res['__ui'] = {'proposal': _ui(p)}
     return res, []
+
+
+# ---------------------------------------------------------------- 工具：合并
+def w_propose_merge(args):
+    """把几笔合成一笔：合计记一笔，每笔变成小明细（导出按小笔展开）。"""
+    sid = str(args.get('__sid') or '')
+    raw = args.get('entry_ids') or []
+    if not isinstance(raw, list):
+        raw = [raw]
+    ids = [x for x in (_opt_int(v) for v in raw) if x]
+    if len(ids) < 2:
+        return {'error': '至少要 2 个 entry_ids 才能合并。'
+                         '先用 query_entries 找到要合并的几笔'}, []
+    if len(ids) > MAX_MERGE:
+        return {'error': f'一次最多合并 {MAX_MERGE} 笔，这次给了 {len(ids)} 笔，请分批'}, []
+    rows, warns = [], []
+    for eid in ids:
+        row = next(iter(_fetch(
+            'SELECT e.*, a.name AS account_name, a.currency FROM entries e '
+            'JOIN accounts a ON a.id=e.account_id WHERE e.id=?', (eid,))), None)
+        if not row:
+            warns.append(f'#{eid} 不存在，跳过')
+            continue
+        rows.append(row)
+    if len(rows) < 2:
+        return {'error': '有效流水不足 2 笔，无法合并'}, []
+    if len({r['account_id'] for r in rows}) > 1:
+        return {'error': '这几笔不在同一个账户，不能合并。请先筛同一账户的流水'}, []
+    if len({1 if r['debit'] else 0 for r in rows}) > 1:
+        return {'error': '里面既有收入又有支出，不能合成一笔，请分两次合并'}, []
+    items = []
+    for r in rows:
+        items.append({'entry_id': r['id'], 'date': r['date'],
+                      'account_name': r['account_name'],
+                      'currency': r['currency'],
+                      'summary': r['description'] or '',
+                      'description': r['description'] or '',
+                      'party': r['party'] or '',
+                      'amount': r['debit'] or r['credit'],
+                      'direction': 'in' if r['debit'] else 'out'})
+    total = round(sum(float(i['amount'] or 0) for i in items), 2)
+    is_in = items[0]['direction'] == 'in'
+    date_v = _parse_date(args.get('date')) if args.get('date') else ''
+    desc_v = str(args.get('description') or '').strip()
+    p = add_proposal(sid, 'merge', f'合并 {len(items)} 笔为一笔', items, warns)
+    p['merge'] = {'entry_ids': [i['entry_id'] for i in items],
+                  'date': date_v or '', 'description': desc_v,
+                  'total': total, 'direction': 'in' if is_in else 'out',
+                  'account_name': items[0]['account_name'],
+                  'currency': items[0]['currency']}
+    with _lock:
+        _save()          # 把 merge 参数一并落盘，确认时按 pid 读回来要用
+    res = {'ok': True, 'pid': p['pid'], 'count': len(items),
+           'draft': (f'合并 {len(items)} 笔 → 1 笔{"收入" if is_in else "支出"} '
+                     f'{total:,.2f}：' + '；'.join(_fmt_item(i) for i in items)[:400]),
+           'warnings': warns,
+           'note': ('草稿已推给用户。合并后账上只留一笔合计，每笔原样成为小明细，'
+                    '导出时按小笔逐行展开；原几笔会被删除（附件改挂到合并后的这一笔）。'
+                    '回复里说清合并哪几笔、合计多少即可。')}
+    res['__ui'] = {'proposal': _ui(p)}
+    return _auto_apply(p, res), []
 
 
 # ---------------------------------------------------------------- 工具：批量
@@ -995,6 +1080,9 @@ def apply_proposal(pid, edits=None, ack=False):
                      f['party'], f['debit'], f['credit'], f['pending'],
                      f['project'], f['note'], A.now_iso()))
                 eid = cur.lastrowid
+                subs = it.get('items') or []
+                if len(subs) >= 2:
+                    A.sync_entry_items(db, eid, subs)
                 tids = list(it.get('tag_ids') or []) + _ensure_tags(
                     db, it.get('tag_names'))
                 if tids:
@@ -1090,6 +1178,24 @@ def apply_proposal(pid, edits=None, ack=False):
                 done.append({'id': eid, 'date': row['date'],
                              'amount': row['debit'] or row['credit'],
                              'direction': 'in' if row['debit'] else 'out'})
+        elif p['kind'] == 'merge':
+            mg = p.get('merge') or {}
+            ids = [int(x) for x in (mg.get('entry_ids') or [])]
+            if not ids:      # 兜底：老草稿没有 merge 字段时按 items 里的流水号合并
+                ids = [int(it['entry_id']) for it in p['items'] if it.get('entry_id')]
+            try:
+                nid, snap = A.merge_entries_db(db, ids, mg.get('date') or '',
+                                               mg.get('description') or '')
+            except ValueError as exc:
+                return {'error': str(exc)}, 400
+            undo['type'] = 'merge'
+            undo['created'] = nid
+            undo['entries'] = snap
+            first = (snap[0]['row'] if snap else {})
+            done.append({'id': nid, 'date': first.get('date') or '',
+                         'amount': mg.get('total') or 0,
+                         'direction': mg.get('direction') or 'out',
+                         'account_id': first.get('account_id')})
         db.commit()
 
     p['status'] = 'done' if done else 'failed'
@@ -1173,6 +1279,41 @@ def undo_write(wid):
                          it.get('description') or '', it.get('party') or '',
                          it.get('amount') or 0, it.get('note') or ''))
                 n += 1
+        elif undo.get('type') == 'merge':
+            # 撤销合并：删掉合成的那一笔，把原几笔原样恢复（附件改挂回第一笔）
+            nid = undo.get('created')
+            if nid:
+                db.execute('DELETE FROM entry_items WHERE entry_id=?', (nid,))
+                db.execute('DELETE FROM entry_tags WHERE entry_id=?', (nid,))
+                db.execute('DELETE FROM entries WHERE id=?', (nid,))
+            first_id = None
+            for e in undo.get('entries') or []:
+                r = e.get('row') or {}
+                if not r:
+                    continue
+                if first_id is None:
+                    first_id = r.get('id')
+                db.execute(
+                    'INSERT OR REPLACE INTO entries(id,account_id,date,check_no,'
+                    'description,party,debit,credit,pending,project,note,created_at) '
+                    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (r.get('id'), r.get('account_id'), r.get('date'),
+                     r.get('check_no'), r.get('description'), r.get('party'),
+                     r.get('debit'), r.get('credit'), r.get('pending'),
+                     r.get('project'), r.get('note'), r.get('created_at')))
+                A.set_entry_tags(db, r.get('id'), e.get('tags') or [])
+                db.execute('DELETE FROM entry_items WHERE entry_id=?', (r.get('id'),))
+                for it in (e.get('items') or []):
+                    db.execute(
+                        'INSERT INTO entry_items(id,entry_id,seq,description,party,'
+                        'amount,note) VALUES(?,?,?,?,?,?,?)',
+                        (it.get('id'), r.get('id'), it.get('seq') or 0,
+                         it.get('description') or '', it.get('party') or '',
+                         it.get('amount') or 0, it.get('note') or ''))
+                n += 1
+            if nid and first_id:
+                db.execute('UPDATE attachments SET entry_id=? WHERE entry_id=?',
+                           (first_id, nid))
         db.commit()
 
     rec['undone'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1290,7 +1431,16 @@ DEFS = [
             'note': {'type': 'string', 'description': '备注'},
             'tags': {'type': 'array', 'items': {'type': 'string'}, 'description': '标签名'},
             'pending': {'type': 'boolean', 'description': '是否未兑现/未到账'},
-        }, 'required': ['date', 'amount', 'direction']}}},
+            'items': {'type': 'array', 'description':
+                      '多笔合记时用：把这一笔拆成几条小明细（例如一笔付了 3 个人的工资）。'
+                      '给了 2 条以上明细时，amount 可以不传，系统按明细合计记账；'
+                      '导出 Excel 时按这些小笔逐行展开。',
+                      'items': {'type': 'object', 'properties': {
+                          'description': {'type': 'string', 'description': '小明细摘要'},
+                          'party': {'type': 'string', 'description': '对方'},
+                          'amount': {'type': 'number', 'description': '小明细金额，正数'},
+                      }, 'required': ['amount']}},
+        }, 'required': ['date', 'direction']}}},
     {'type': 'function', 'function': {
         'name': 'propose_update_entry',
         'description': '修改一笔已有流水。只传要改的字段。'
@@ -1325,6 +1475,23 @@ DEFS = [
             'entry_ids': {'type': 'array', 'items': {'type': 'integer'},
                           'description': '要删的流水 id 列表，一次最多 20 笔'},
             'reason': {'type': 'string', 'description': '为什么要删，会显示在卡片上'},
+        }, 'required': ['entry_ids']}}},
+    {'type': 'function', 'function': {
+        'name': 'propose_merge_entries',
+        'description': '把已经记好的几笔合并成一笔（合计金额记一笔，每笔原样变成小明细，'
+                       '导出 Excel 时按小笔逐行展开）。用户说「这几笔合并」「合成一笔」'
+                       '「加起来记一条」时用。要求这几笔在同一账户、同方向（都是收入或'
+                       '都是支出）。合并会删除原几笔，附件改挂到合并后的这一笔。'
+                       '系统按权限策略决定直接写入还是生成待确认草稿，以返回的 auto 为准。',
+        'parameters': {'type': 'object', 'properties': {
+            'entry_ids': {'type': 'array', 'items': {'type': 'integer'},
+                          'description': '要合并的流水 id（先用 query_entries 查到），至少 2 个，'
+                                         '一次最多 30 个'},
+            'date': {'type': 'string',
+                     'description': '合并后记到哪一天 YYYY-MM-DD，不传＝用第一笔的日期'},
+            'description': {'type': 'string',
+                            'description': '合并后的摘要，不传＝用第一笔的摘要'},
+            'reason': {'type': 'string', 'description': '为什么合并，会显示在卡片上'},
         }, 'required': ['entry_ids']}}},
     {'type': 'function', 'function': {
         'name': 'import_file',
@@ -1367,7 +1534,7 @@ DEFS = [
         'name': 'undo_write',
         'description': '撤销一次已经落库的写入（回滚到写入前的状态）。用户说「撤回去」'
                        '「刚才那笔记错了，撤回」「恢复原样」时用。不传 wid 就撤销本会话'
-                       '最近一次写入。只对新增/修改/删除流水有效。',
+                       '最近一次写入。对新增/修改/删除/合并流水都有效。',
         'parameters': {'type': 'object', 'properties': {
             'wid': {'type': 'string',
                     'description': '要撤销的写入 id；省略=最近一次'},
@@ -1379,6 +1546,7 @@ WRITE_IMPL = {
     'propose_entry': w_propose_entry,
     'propose_update_entry': w_propose_update,
     'propose_delete_entries': w_propose_delete,
+    'propose_merge_entries': w_propose_merge,
     'import_file': w_import_file,
     'propose_import': w_propose_import,
     'undo_write': w_undo,
@@ -1387,6 +1555,7 @@ WRITE_LABELS = {
     'propose_entry': '写入一笔流水',
     'propose_update_entry': '修改流水',
     'propose_delete_entries': '起草删除',
+    'propose_merge_entries': '起草合并',
     'import_file': '解析对账单',
     'propose_import': '起草批量导入',
     'undo_write': '撤销上次写入',

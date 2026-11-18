@@ -701,3 +701,18 @@ body.agent-open.side-open #main{margin-right:calc(var(--agent-w) + 210px)}
   .item-line{grid-template-columns:20px 1fr 100px 32px}
   .item-line .inp[data-k="party"]{display:none}
 }
+
+/* ---------- 多选合并 ---------- */
+.pick-bar{background:#eef4ff;border:1px solid #cddffb;border-radius:10px;padding:9px 14px;
+  color:#334155}
+.pick-bar b{color:#1d4ed8}
+.warn-txt{color:#b42318;font-weight:600}
+.tbl tbody tr.picked-row td{background:#eef4ff}
+.tbl tbody tr.picked-row:hover td{background:#e3edfe}
+.tbl tbody tr.picked-row td:first-child{box-shadow:inset 3px 0 0 #2563eb}
+.merge-list{display:flex;flex-direction:column;gap:4px;max-height:280px;overflow:auto;
+  border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:#fbfcfe}
+.merge-line{display:flex;align-items:center;gap:8px;font-size:13px;padding:4px 2px;
+  border-bottom:1px dashed #eef2f7}
+.merge-line:last-child{border-bottom:none}
+.merge-desc{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

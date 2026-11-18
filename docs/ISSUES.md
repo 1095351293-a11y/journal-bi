@@ -8,7 +8,6 @@
 ## 2026-11-18
 
 ### 1. 多笔钱只能一笔笔记，账上能汇总但看不到每笔是谁、导出也没法拆
-
 - **现象**：发一次工资、付一批供应商，银行只出一条总金额，但实际是十几个人的钱。分开记 → 银行流水对不上笔数；合成一笔 → 明细丢掉，导出给财务还是"工资 10000"一行，看不出张三李四各多少。
 - **原因**：`entries` 表一笔就是一行，没有「父记录 + 子明细」的层次；导出也是按 `entries` 逐行写，天然拆不开。
 - **解决**：
@@ -18,6 +17,18 @@
   - **导出**：`write_entry()` 增加 `item` 参数；`emit_booked()` 把一笔按明细拆成多行，逐行 `上一行余额 ± 本行金额`，**只在最后一行做真实余额校准**（`adj`），保证拆开前后期末余额分毫不差。月度分组的 `SUM` 范围和月末余额引用同步改成"展开后的实际行数"，否则会少算。
   - **配套**：删除流水/删除账户级联清理 `entry_items`；关键词筛选把明细摘要也算进 haystack（搜"王五"能整组带出来）；AI 删除分录时明细一并存入 undo，撤销时还原。
 - **涉及**：`app.py`（`SCHEMA`、`entry_items_map`、`sync_entry_items`、`serialize_entries`、`add_entry`、`upd_entry`、`del_entry`、`_delete_account_db`、`export_excel`）、`agent_write.py`、`static/app.js`（`journalRow`、`itemRows`、`openEntryModal`）、`static/style.css`
+- **提交**：本次
+
+### 2. 已经分开记的几笔想合成一笔，没有入口；AI 也不会合并
+
+- **现象**：先逐笔记了「付甲 3000」「付乙 2000」，事后想合成一笔 5000 + 两条明细，界面只能删了重录；问 AI「这几笔合并」，它只会说做不到。
+- **原因**：上一版只做了「一笔 → 多条小明细」的录入方向，没有反向的「多条流水 → 一笔明细组」；`agent_write` 的工具集只有新增/修改/删除。
+- **解决**：
+  - 抽出 `merge_entries_db(db, ids, date, desc)` 给界面和 AI 共用：校验同一账户、同方向 → 明细铺平（本身带明细的先展开，避免层级被压掉）→ 新建父记录（合计金额）→ 附件改挂到新记录 → 删原几笔 → 返回撤销快照。
+  - **界面**：工具栏「🔗 多选合并」进选择模式（行首复选框、选中行蓝底高亮、已选合计与方向校验），选 ≥2 笔点「合并选中」弹出确认窗——可改日期/摘要，列出将要变成明细的每一笔，确认后一个事务完成。
+  - **AI**：新增 `propose_merge_entries` 工具（草稿卡 → 确认 → 执行，走正常权限策略）；`propose_entry` 补 `items` 参数，一句话就能记成组合分录（只给明细不给总额时自动按合计记账）。
+  - **撤销**：`undo` 增加 `merge` 类型——删掉合成的那一笔、原几笔连标签和明细一起还原、附件改挂回第一笔。
+- **涉及**：`app.py`（`merge_entries_db`、`/api/entries/merge`）、`agent_write.py`（`w_propose_merge`、`DEFS`、`apply_proposal`、`undo_write`、`_norm_sub_items`）、`static/app.js`（`jrSelectMode`、`openMergeModal`、`itemRows`、草稿卡 `merge` 标签）、`static/style.css`
 - **提交**：本次
 
 ---
