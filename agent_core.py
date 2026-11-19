@@ -152,7 +152,16 @@ def route_intent(text, has_facts=False, has_atts=False, has_pending=False):
 
 
 def pick_tools(names, allow_write=False):
-    """按意图裁剪工具。写入工具只在明确要改账时才挂上，纯查询时不给。"""
+    """装配这一轮的工具清单。
+
+    只读模式下无论调用方怎么要求，都不下发写工具——这是模式闸门，不是建议。
+    """
+    try:
+        from agent_perm import allow_write_tools
+        if not allow_write_tools():
+            allow_write = False
+    except Exception:
+        pass
     pool = TOOLS if allow_write else [
         t for t in TOOLS if t['function']['name'] not in WRITE_NAMES]
     if names is None:
@@ -563,7 +572,10 @@ def run_tool(name, args, sid=''):
     if not impl:
         return {'error': f'未知工具 {name}'}, []
     t0 = time.time()
-    a = dict(args) if isinstance(args, dict) else {}
+    # 剥离模型传来的内部键（__sid / __approved 之类只能由服务端注入），
+    # 否则模型传一句 __approved=true 就能跳过审核卡。
+    a = ({k: v for k, v in args.items() if not str(k).startswith('__')}
+         if isinstance(args, dict) else {})
     if sid:
         a['__sid'] = sid          # 写入工具靠它把草稿挂到当前会话
     try:
@@ -892,6 +904,30 @@ def get_file(fid):
         return serve_file(fid)
     except Exception as exc:
         return jsonify({'error': str(exc)}), 404
+
+
+@bp.get('/api/agent/mode')
+def get_mode():
+    """当前访问模式 + 四档说明，前端顶部选择器用。"""
+    try:
+        import agent_perm
+        return jsonify(agent_perm.state())
+    except Exception as exc:
+        return jsonify({'error': f'{type(exc).__name__}: {exc}'}), 500
+
+
+@bp.post('/api/agent/mode')
+def set_mode():
+    """切换访问模式。只认 readonly / ask / auto / full，写盘后即时生效。"""
+    data = request.get_json(silent=True) or {}
+    try:
+        import agent_perm
+        agent_perm.set_mode(data.get('mode'))
+        return jsonify(agent_perm.state())
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'error': f'{type(exc).__name__}: {exc}'}), 500
 
 
 @bp.get('/api/agent/facts')

@@ -7,6 +7,23 @@
 
 ## 2026-11-19
 
+### 6. AI 有些操作没经过我审核就直接改了
+
+- **现象**：让 AI 删公司、删账户、改期初余额，它说一句「已删除」就真删了，用户全程没看到确认；记账、改账、建账户更是一直直接落库，没有任何提示。
+- **原因**：两处设计漏洞叠加。
+  1. `agent_perm.py` 只有 `auto / confirm` 两个值，且默认 `create/update/admin = auto`——记账、改账、日常维护全部直接写，用户看不到草稿卡。
+  2. 更严重的是 `agent_admin.py` 的 `_need_confirm` 返回的 note 写着「**他已经明确说确认时，立刻带 confirm=true 重新调用一次**」。`confirm` 是模型自己填的参数，等于**模型自己确认自己**：它判断「用户大概同意了」就直接执行，用户根本没点过任何按钮。
+- **解决**：改成四档访问模式，闸门收到服务端。
+  - **四档**：`readonly` 只读（写工具根本不下发）/ `ask` 逐条确认（所有写入出草稿卡，默认）/ `auto` 自动写入（记账改账日常维护直接写，删除·导入·删公司账户仍要确认）/ `full` 完全访问（任何操作直接执行）。存在 `data/agent_perm.json` 的 `mode` 字段，改完即时生效。
+  - **只有 `full` 接受模型自带的 `confirm=true`**：`_approved(args)` 同时要求 `confirm` 与 `can_bypass()`，其他模式一律生成审核卡。
+  - **审核卡只能人点**：高危操作改成 `add_proposal(kind='admin', danger=True)`，前端渲染成带「我已核对」勾选的卡片，确认动作走 `/api/agent/proposal/<pid>/confirm`。模型没有这条通路。
+  - **防止伪造内部标记**：`run_tool` 和 `skill.run` 在注入 `__sid` 前先剥掉模型传来的所有 `__*` 键，否则模型传 `__approved=true` 就能跳过审核。
+  - **新增接口**：`GET/POST /api/agent/mode`；助手右上角加模式选择器（只读灰 / 确认蓝 / 自动绿 / 完全访问红），切到完全访问时弹二次确认。
+  - `merge` 此前不在任何策略表里，一直是「永远确认」，这次归入 `auto/full` 的直写范围。
+  - 老格式 `{"create":"auto",...}` 读到时按松紧自动迁移成对应 mode，不让人升级后行为突变。
+- **涉及**：`agent_perm.py`（重写）、`agent_admin.py`（`_approved` / `_need_confirm` / 7 处 gate）、`agent_write.py`（`_apply_admin`、`apply_proposal` 分发、`_ui` 带 impact）、`agent_core.py`（`pick_tools` 只读过滤、模式接口、`run_tool` 剥键）、`agent_extra.py`（删附件走审核卡）、`agent_skill.py`（剥键）、`prompts/agent_system.md`、`static/index.html`、`static/app.js`、`static/style.css`
+- **提交**：本次
+
 ### 5. 聊到第 13 轮，前面说过的全没了
 
 - **现象**：长对话里用户说「就按刚才那个口径」「把前面那三笔再算一遍」，模型答非所问，因为它根本看不到那些内容。

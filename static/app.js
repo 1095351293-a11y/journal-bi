@@ -151,6 +151,8 @@ async function refreshAfterWrite(){
 async function boot(){
   await refreshBootstrap();
   bindStatic();
+  agentBindMode();
+  await agentLoadMode();
   viewStateRestore();
   S.agent.msgs = agentLoadMsgs();
   await initAgentDock();
@@ -2854,7 +2856,7 @@ function agentMsgHTML(m, idx){
 }
 /* ---- 写入草稿卡片 ---- */
 const AG_PROP_KIND = {create:'新增流水', import:'批量导入', update:'修改流水',
-                      delete:'删除流水', merge:'合并流水'};
+                      delete:'删除流水', merge:'合并流水', admin:'待确认操作'};
 function agPropDir(it){
   return (it.debit || it.direction === 'in') ? 'in' : 'out';
 }
@@ -2989,7 +2991,39 @@ function agPropItemsHTML(p, mi, pi){
   return `<div class="ag-prop-tbl"><table>
       <thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>${total}`;
 }
+function agAdminCardHTML(p, mi, pi){
+  // 管理类高危操作（删公司/账户/标签/定期/盘点单/附件、改期初）
+  // 只有用户点这里才真正执行；模型没有别的通路。
+  const st = p.status || 'pending';
+  const stTxt = ({pending:'待确认', done:'已执行', cancelled:'已取消',
+                  failed:'未执行'}[st] || st);
+  const head = `<div class="ag-prop-h">
+      <span class="ag-prop-ico">${st === 'pending' ? '⚠️' : (st === 'done' ? '✓' : '·')}</span>
+      <span class="ag-prop-t">${esc(p.title || AG_PROP_KIND[p.kind] || '待确认操作')}</span>
+      <span class="ag-prop-st ${st}">${esc(stTxt)}</span>
+    </div>`;
+  if(st !== 'pending'){
+    const r = p.result || {};
+    const line = st === 'done' ? (r.message || '已执行')
+      : (st === 'cancelled' ? '已取消，数据没有变化'
+        : (r.message || (r.fails || [])[0] || '没有执行'));
+    return `<div class="ag-prop ${st} danger">${head}
+      <div class="ag-prop-res">${esc(line)}</div></div>`;
+  }
+  return `<div class="ag-prop danger open">${head}
+    <div class="ag-prop-warn">${esc(p.impact || '这是一步会改动系统结构的操作')}</div>
+    <label class="ag-prop-ack">
+      <input type="checkbox" class="ag-ack" data-mi="${mi}" data-pi="${pi}" ${p.ack?'checked':''}>
+      我已核对上面的影响，确认执行</label>
+    <div class="ag-prop-f">
+      <button class="btn sm danger" data-action="prop-confirm" data-mi="${mi}" data-pi="${pi}"
+        ${p.ack ? '' : 'disabled'}>确认执行</button>
+      <button class="btn sm" data-action="prop-cancel" data-mi="${mi}" data-pi="${pi}">取消</button>
+      <span class="muted small">确认前不会改动数据</span>
+    </div></div>`;
+}
 function agProposalHTML(p, mi, pi){
+  if(p.kind === 'admin') return agAdminCardHTML(p, mi, pi);
   const st = p.status || 'pending';
   const stTxt = (p.replaced && st === 'cancelled') ? '已作废'
     : ({pending:'待确认', done:'已写入', undone:'已撤销',
@@ -3294,7 +3328,8 @@ async function agPropConfirm(mi, pi){
     const r = await jpost(`/api/agent/proposal/${p.pid}/confirm`,
                           {edits: agPropEdits(p), ack: !!p.ack});
     p.status = r.done ? 'done' : 'failed';
-    p.result = {done: r.done, failed: r.failed, fails: r.fails, wid: r.wid};
+    p.result = {done: r.done, failed: r.failed, fails: r.fails, wid: r.wid,
+                message: r.message};
     p.editing = false;
     if(r.done){
       await refreshAfterWrite();
@@ -3572,6 +3607,63 @@ function agentClose(){
 function agentToggle(){
   const dock = $('#agentDock');
   if(dock && dock.classList.contains('open')) agentClose(); else agentOpen();
+}
+
+/* ---------------------------------------------------------------- 访问模式
+   四档：只读 / 逐条确认 / 自动写入 / 完全访问。
+   只有「完全访问」下 AI 才能不经过用户就执行任何操作。
+   状态存在服务端 data/agent_perm.json，换浏览器也一致。 */
+let AG_MODE = null;
+async function agentLoadMode(){
+  const sel = $('#agentModeSel');
+  if(!sel) return;
+  try{
+    const r = await fetch('/api/agent/mode');
+    const d = await r.json();
+    if(d.error) return;
+    AG_MODE = d;
+    sel.innerHTML = (d.modes || []).map(m =>
+      `<option value="${m.id}">${esc(m.label)}</option>`).join('');
+    sel.value = d.mode || 'ask';
+    agentPaintMode();
+  }catch(e){ /* 拉不到就保持默认文案，不打断使用 */ }
+}
+function agentPaintMode(){
+  const sel = $('#agentModeSel');
+  if(!sel || !AG_MODE) return;
+  const cur = (AG_MODE.modes || []).find(x => x.id === sel.value) || {};
+  sel.dataset.mode = sel.value;
+  sel.title = 'AI 访问模式：' + (cur.desc || '')
+    + '（点这里切换；只有「完全访问」才会不询问你直接执行任何操作）';
+}
+async function agentSetMode(mode, prev){
+  try{
+    const r = await fetch('/api/agent/mode', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({mode})});
+    const d = await r.json();
+    if(d.error){ alert(d.error); if(prev) $('#agentModeSel').value = prev; return; }
+    AG_MODE = d;
+    agentPaintMode();
+  }catch(e){
+    alert('切换模式失败：' + e.message);
+    if(prev) $('#agentModeSel').value = prev;
+    agentPaintMode();
+  }
+}
+function agentBindMode(){
+  const sel = $('#agentModeSel');
+  if(!sel || sel._bound) return;
+  sel._bound = true;
+  sel.addEventListener('change', async () => {
+    const prev = (AG_MODE && AG_MODE.mode) || 'ask';
+    const next = sel.value;
+    if(next === 'full' && !confirm(
+      '「完全访问」模式下，AI 记账、改账、删除流水、删公司或账户都不会再问你，直接执行。\n\n'
+      + '流水类写入还能说「撤销这次」还原，但删公司 / 删账户删掉就没了。\n\n'
+      + '确定要开启吗？')){ sel.value = prev; return; }
+    await agentSetMode(next, prev);
+  });
 }
 
 async function initAgentDock(){

@@ -273,11 +273,19 @@ def t_delete_attachment(args):
         return {'error': f'没有 id={aid} 的附件'}, []
     a = rr[0]
     who = f"{a['date']} {a['description'] or '流水'}"
-    if not args.get('confirm'):
-        return {'need_confirm': True, 'att_id': aid,
-                'impact': f"将永久删除附件「{a['orig_name']}」（挂在 {who} 上），"
-                          f"文件删掉后无法恢复，流水本身不受影响",
-                'hint': '把 impact 原样告给用户，他说确认后再带 confirm=true 重调'}, []
+    try:
+        from agent_admin import _approved, _need_confirm
+    except Exception:
+        _approved, _need_confirm = (lambda x: False), None
+    if not _approved(args):
+        impact = (f"将永久删除附件「{a['orig_name']}」（挂在 {who} 上），"
+                  f"文件删掉后无法恢复，流水本身不受影响")
+        if _need_confirm:
+            return _need_confirm('删除附件', impact, 'delete_attachment',
+                                 args, str(args.get('__sid') or ''),
+                                 module='agent_extra'), []
+        return {'need_confirm': True, 'att_id': aid, 'impact': impact,
+                'hint': '把影响告给用户，等他在界面上确认'}, []
     if _APP is None or 'del_attachment' not in _VIEWS:
         return {'error': '删除模块未就绪'}, []
     try:

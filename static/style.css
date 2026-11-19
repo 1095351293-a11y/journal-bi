@@ -312,6 +312,21 @@ body.agent-open #navAgent{background:var(--blue);color:#fff;font-weight:600}
 .agent-head-l{display:flex;align-items:baseline;gap:8px;min-width:0;overflow:hidden}
 .agent-head-l b{white-space:nowrap}
 .agent-head-l .muted{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 访问模式选择器：只读灰、逐条确认蓝、自动写入绿、完全访问红 */
+.agent-mode-sel{height:28px;padding:0 6px;border-radius:8px;cursor:pointer;
+  font:inherit;font-size:12px;font-weight:600;
+  border:1px solid var(--line);background:var(--card);color:var(--text);
+  max-width:104px;text-overflow:ellipsis}
+.agent-mode-sel:focus{outline:2px solid rgba(37,99,235,.35);outline-offset:1px}
+.agent-mode-sel[data-mode="readonly"]{color:#64748b;border-color:#cbd5e1;background:#f1f5f9}
+.agent-mode-sel[data-mode="ask"]{color:#1d4ed8;border-color:#bfdbfe;background:#eff6ff}
+.agent-mode-sel[data-mode="auto"]{color:#047857;border-color:#a7f3d0;background:#ecfdf5}
+.agent-mode-sel[data-mode="full"]{color:#b91c1c;border-color:#fecaca;background:#fef2f2;
+  box-shadow:0 0 0 2px rgba(220,38,38,.12)}
+html[data-theme="dark"] .agent-mode-sel[data-mode="readonly"]{background:#1e293b;border-color:#334155;color:#94a3b8}
+html[data-theme="dark"] .agent-mode-sel[data-mode="ask"]{background:#172554;border-color:#1e40af;color:#93c5fd}
+html[data-theme="dark"] .agent-mode-sel[data-mode="auto"]{background:#052e2b;border-color:#0f766e;color:#5eead4}
+html[data-theme="dark"] .agent-mode-sel[data-mode="full"]{background:#450a0a;border-color:#991b1b;color:#fca5a5}
 .agent-fab{position:fixed;right:24px;bottom:24px;width:52px;height:52px;
   border-radius:50%;border:0;background:var(--blue);color:#fff;font-size:22px;
   line-height:1;cursor:pointer;z-index:39;

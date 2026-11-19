@@ -167,7 +167,8 @@ def run(sk, params, sid=''):
         if not impl:
             out.append({'step': i, 'tool': tool, 'error': '没有这个工具'})
             continue
-        a = _subst(st.get('args') or {}, ctx)
+        a = {k: v for k, v in _subst(st.get('args') or {}, ctx).items()
+             if not str(k).startswith('__')}
         if sid:
             a['__sid'] = sid
         try:

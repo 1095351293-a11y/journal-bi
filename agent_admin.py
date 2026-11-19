@@ -85,13 +85,70 @@ def _audit(tool, action, args, result, sid=''):
         pass
 
 
-def _need_confirm(what, impact):
-    return {'error': f'{what}属高危操作，需要用户明确同意后才能执行',
-            'need_confirm': True,
-            'impact': impact,
-            'note': ('把上面这些影响原样告诉用户。他已经明确说「确认/删吧/我同意」时，'
-                     '立刻带 confirm=true 重新调用一次把事办完；'
-                     '他还没表态时，就停在这里等。')}
+def _approved(args):
+    """高危操作是否已获执行授权。
+
+    光带 ``confirm=true`` 不算——那只是模型自己的判断。
+    必须**同时**处于「完全访问」模式，才算用户真的放开了这一档。
+    其他模式下即使模型带 confirm 也只会得到审核卡。
+    """
+    if args.get('__approved'):
+        # 只有服务端审核卡执行路径会设这个标记（入口已剥离模型传入的 __* 键）
+        return True
+    if not args.get('confirm'):
+        return False
+    try:
+        from agent_perm import can_bypass
+        return bool(can_bypass())
+    except Exception:
+        return False
+
+
+def _need_confirm(what, impact, tool='', args=None, sid='', module='agent_admin'):
+    """高危操作的闸门。
+
+    只有「完全访问」模式才允许模型自己带 ``confirm=true`` 直接执行。
+    其他模式一律生成一张审核卡，必须由用户在界面上点「确认执行」——
+    确认动作只发生在前端点按钮那一刻，模型拿不到这条通路，
+    所以它没法自我授权（以前那句「立刻带 confirm=true 重调」就是漏洞）。
+    """
+    try:
+        from agent_perm import can_bypass
+        bypass = can_bypass()
+    except Exception:
+        bypass = False
+
+    if bypass:
+        return {'error': f'{what}属高危操作，需要用户明确同意后才能执行',
+                'need_confirm': True,
+                'impact': impact,
+                'note': ('把上面这些影响原样告诉用户。他已经明确说「确认/删吧/我同意」时，'
+                         '立刻带 confirm=true 重新调用一次把事办完；'
+                         '他还没表态时，就停在这里等。')}
+
+    try:
+        import agent_write as W
+        p = W.add_proposal(sid, 'admin', what, [{'summary': impact}], danger=True)
+        p['admin'] = {'tool': tool, 'module': module,
+                      'args': {k: v for k, v in (args or {}).items()
+                               if not str(k).startswith('__') and k != 'confirm'}}
+        p['impact'] = impact
+        with W._lock:
+            W._save()
+        res = {'ok': True,
+               'pending_approval': True,
+               'pid': p['pid'],
+               'impact': impact,
+               'note': ('已在对话里生成审核卡，等用户点「确认执行」才会真正执行。'
+                        '不要自己带 confirm 重调，也不要说已经删了或已经改好了；'
+                        '把影响说清楚，然后停下来等。')}
+        res['__ui'] = {'proposal': W._ui(p)}
+        return res
+    except Exception as exc:                      # 卡片都生成不了就别硬来
+        return {'error': f'{what}需要用户确认，但审核卡生成失败：'
+                         f'{type(exc).__name__}: {exc}',
+                'impact': impact,
+                'note': '告诉用户这步需要他自己在界面上操作。'}
 
 
 def _db():
@@ -100,7 +157,7 @@ def _db():
 
 # ---------------------------------------------------------------- 系统概况
 def t_system_info(args):
-    from agent_perm import describe, load as perm_load
+    from agent_perm import describe, state as perm_state
     accs = _fetch('SELECT COUNT(*) n FROM accounts')[0]['n']
     ents = _fetch('SELECT COUNT(*) n, MIN(date) a, MAX(date) b FROM entries')[0]
     tags = _fetch('SELECT COUNT(*) n FROM tags')[0]['n']
@@ -119,14 +176,18 @@ def t_system_info(args):
                                 'mb': round(os.path.getsize(p) / 1024 / 1024, 2)})
             except OSError:
                 pass
+    from agent_perm import describe, state as perm_state
+    ps = perm_state()
     return {'companies': _companies(), 'accounts': accs,
             'entries': {'count': ents['n'], 'from': ents['a'], 'to': ents['b']},
             'tags': tags, 'deposits': deps, 'cash_counts': cc,
             'db_mb': size, 'recent_backups': backups,
-            'permissions': perm_load(), 'permission_summary': describe(),
+            'access_mode': {'mode': ps['mode'], 'label': ps['label'],
+                            'desc': ps['desc']},
+            'permission_summary': describe(),
             'data_dir': DATA_DIR,
-            'note': '数据库文件与备份都在 data_dir 下；恢复备份要在页面「设置」里操作，'
-                    '没有开放给 AI。'}, []
+            'note': '访问模式由用户在助手右上角切换，你不能替他改。'
+                    '恢复备份要在页面「设置」里操作，没有开放给 AI。'}, []
 
 
 def t_backup_now(args):
@@ -203,8 +264,8 @@ def t_manage_company(args):
                            [a['id'] for a in accs])[0]['n']
         impact = (f"公司「{c['name']}」下 {len(accs)} 个账户、{n_ent} 笔流水、"
                   f"以及其定期存款和现金盘点单将一并删除，且不可恢复（除非有备份）")
-        if not args.get('confirm'):
-            return _need_confirm('删除公司', impact), []
+        if not _approved(args):
+            return _need_confirm('删除公司', impact, 'manage_company', args, sid), []
         with A._write_lock:
             for a in accs:
                 A._delete_account_db(db, a['id'])
@@ -275,8 +336,13 @@ def t_manage_account(args):
         warns = []
         new_opening = args.get('opening')
         if new_opening not in (None, '') and abs(_num(new_opening) - (acc.get('opening') or 0)) > 0.005:
-            warns.append(f"期初余额会从 {acc.get('opening') or 0:,.2f} 改为 "
-                         f"{_num(new_opening):,.2f}，所有余额都会跟着变")
+            impact = (f"账户「{acc['name']}」期初余额从 {acc.get('opening') or 0:,.2f} "
+                      f"改为 {_num(new_opening):,.2f}，该账户所有时点余额、"
+                      f"公司合计和报表都会跟着变")
+            if not _approved(args):
+                return _need_confirm('修改账户期初余额', impact,
+                                     'manage_account', args, sid), []
+            warns.append(impact)
         kind = str(args.get('kind') or acc.get('kind') or 'bank')
         if kind not in ('bank', 'cash'):
             kind = 'bank'
@@ -308,8 +374,8 @@ def t_manage_account(args):
         n = _fetch('SELECT COUNT(*) n FROM entries WHERE account_id=?', (acc['id'],))[0]['n']
         impact = (f"账户「{acc['name']}」及其 {n} 笔流水、相关附件和标签关联将全部删除，"
                   f'不可恢复（除非有备份）')
-        if not args.get('confirm'):
-            return _need_confirm('删除账户', impact), []
+        if not _approved(args):
+            return _need_confirm('删除账户', impact, 'manage_account', args, sid), []
         with A._write_lock:
             A._delete_account_db(db, acc['id'])
             db.commit()
@@ -377,8 +443,8 @@ def t_manage_tag(args):
             return {'error': err}, []
         n = _fetch('SELECT COUNT(*) n FROM entry_tags WHERE tag_id=?', (t['id'],))[0]['n']
         impact = f"标签「{t['name']}」会从 {n} 笔流水上摘掉（流水本身不删）"
-        if not args.get('confirm'):
-            return _need_confirm('删除标签', impact), []
+        if not _approved(args):
+            return _need_confirm('删除标签', impact, 'manage_tag', args, sid), []
         with A._write_lock:
             db.execute('DELETE FROM entry_tags WHERE tag_id=?', (t['id'],))
             db.execute('DELETE FROM tags WHERE id=?', (t['id'],))
@@ -460,8 +526,8 @@ def t_manage_deposit(args):
             return {'error': '找不到这笔定期存款，先 list_deposits 拿 id'}, []
         impact = (f"定期 #{did} {row['currency']} {row['principal']:,.2f} "
                   f"（{row['start_date']}~{row['end_date']}）记录会被删除")
-        if not args.get('confirm'):
-            return _need_confirm('删除定期存款记录', impact), []
+        if not _approved(args):
+            return _need_confirm('删除定期存款记录', impact, 'manage_deposit', args, sid), []
         db.execute('DELETE FROM deposits WHERE id=?', (did,))
         db.commit()
         res = {'ok': True, 'message': f'已删除定期存款 #{did}'}
@@ -572,8 +638,8 @@ def t_manage_cash_count(args):
         if not row:
             return {'error': '找不到这张盘点单，先 list_cash_counts 拿 id'}, []
         impact = f"盘点单 #{cid}（{row['count_date']}）及其面额明细会被删除"
-        if not args.get('confirm'):
-            return _need_confirm('删除盘点单', impact), []
+        if not _approved(args):
+            return _need_confirm('删除盘点单', impact, 'manage_cash_count', args, sid), []
         with A._write_lock:
             db.execute('DELETE FROM cash_count_denoms WHERE item_id IN '
                        '(SELECT id FROM cash_count_items WHERE count_id=?)', (cid,))

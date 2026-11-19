@@ -164,7 +164,12 @@ def _auto_apply(p, res):
     res['auto'] = True
     res['written'] = payload.get('items') or []
     res['wid'] = payload.get('wid')
-    res['note'] = ('已直接写入账本（用户授予了直写权限，不需要点确认）。'
+    try:
+        from agent_perm import current_mode
+        where = {'auto': '自动写入', 'full': '完全访问'}.get(current_mode(), '直写')
+    except Exception:
+        where = '直写'
+    res['note'] = (f'当前是{where}模式，已直接落库，不需要点确认。'
                    '回复时说明写入了哪几笔，并把 wid 一并告诉用户，'
                    '他可随时说「撤销这次」来还原。')
     return res
@@ -468,6 +473,7 @@ def _ui(p):
     return {'pid': p['pid'], 'kind': p['kind'], 'title': p['title'],
             'items': p['items'], 'warnings': p['warnings'][:12],
             'danger': p['danger'], 'at': p['at'],
+            'impact': p.get('impact') or '',
             'superseded': p.get('_superseded') or []}
 
 
@@ -1160,6 +1166,59 @@ def _log(rec):
         pass
 
 
+def _apply_admin(p):
+    """管理类高危操作落库。
+
+    只有用户在界面上点「确认执行」才会走到这里（HTTP 走 api_confirm），
+    模型没有这条通路。管理函数内部自己持写锁，所以这里不能先拿锁，
+    否则 threading.Lock 不可重入会死锁。
+    """
+    import agent_admin as AD
+    spec = p.get('admin') or {}
+    tool = str(spec.get('tool') or '')
+    mod = str(spec.get('module') or 'agent_admin')
+    M = AD
+    if mod != 'agent_admin':
+        try:
+            M = __import__(mod)
+        except Exception:
+            M = None
+    fn = (getattr(M, 'IMPL', {}) or {}).get(tool) if M else None
+    if not fn:
+        p['status'] = 'failed'
+        p['result'] = {'done': 0, 'fails': [f'这条审核卡对应的操作已不存在：{tool}']}
+        with _lock:
+            _save()
+        return {'error': f'这条审核卡对应的操作已不存在：{tool}'}, 400
+
+    a = dict(spec.get('args') or {})
+    a.update({'confirm': True, '__approved': True, '__sid': p.get('sid') or ''})
+    try:
+        res, _extra = fn(a)
+    except Exception as exc:
+        res = {'error': f'{type(exc).__name__}: {exc}'}
+
+    ok = bool(res.get('ok')) and not res.get('error')
+    msg = str(res.get('message') or res.get('error') or '')
+    p['status'] = 'done' if ok else 'failed'
+    p['result'] = {'done': 1 if ok else 0,
+                   'fails': [] if ok else [msg[:300]],
+                   'message': msg}
+    with _lock:
+        _save()
+    try:
+        _log({'wid': '', 'ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+              'pid': p['pid'], 'kind': 'admin', 'sid': p.get('sid'),
+              'count': 1 if ok else 0,
+              'items': [{'summary': msg}], 'undo': None,
+              'approved_by': 'user-click'})
+    except Exception:
+        pass
+    return {'ok': ok, 'done': 1 if ok else 0, 'failed': 0 if ok else 1,
+            'fails': [] if ok else [msg[:300]], 'kind': 'admin',
+            'wid': None, 'items': [], 'message': msg}, (200 if ok else 400)
+
+
 def apply_proposal(pid, edits=None, ack=False):
     """真正落库。返回 (payload, http_status)。"""
     p = get_proposal(pid)
@@ -1169,6 +1228,9 @@ def apply_proposal(pid, edits=None, ack=False):
         return {'error': f"这张草稿已经{'执行过' if p['status'] == 'done' else '取消了'}"}, 409
     if p['danger'] and not ack:
         return {'error': '这是删除操作，需要先勾选「我已核对，确认删除」'}, 400
+
+    if p['kind'] == 'admin':
+        return _apply_admin(p)
 
     A = _wdb()
     db = A.get_db()
