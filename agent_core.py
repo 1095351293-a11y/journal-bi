@@ -718,7 +718,8 @@ def _typewriter(s):
         time.sleep(0.008)
 
 
-def run_agent_stream(cfg, sid, history, text, atts=None, company_id=None):
+def run_agent_stream(cfg, sid, history, text, atts=None, company_id=None,
+                     force_agent=False):
     """yield 事件 dict；由 SSE 层序列化。"""
     t0 = time.time()
     atts = atts or []
@@ -730,6 +731,10 @@ def run_agent_stream(cfg, sid, history, text, atts=None, company_id=None):
         except Exception:
             pending = False
         route = route_intent(text, bool(d['facts']), bool(atts), pending)
+        # 斜杠调用技能时直接用 agent 模式：要跑脚本、要读说明，
+        # 被意图正则判成「基于已有结果」就只剩几个只读工具，等于没调起来。
+        if force_agent:
+            route = {'mode': 'agent', 'tools': [], 'slash': True}
         yield {'t': 'route', 'mode': route['mode'],
                'label': ('看图并核对账目' if atts else
                          {'direct': '直接回答', 'context': '基于已有结果',
@@ -920,7 +925,8 @@ def chat_stream():
     text = str(data.get('message') or '').strip()
     if not text:
         return jsonify({'error': '请输入问题'}), 400
-    text, _slash = expand_slash(text)      # /技能id → 明确的调用指令
+    # /技能id → 已改写成明确指令；_slash 非空时下面强制走 agent 模式
+    text, _slash = expand_slash(text)
     cfg = load_config()
     err = _cfg_ready(cfg)
     if err:
@@ -941,7 +947,8 @@ def chat_stream():
             yield sse({'t': 'start', 'model': cfg.get('model'),
                        'vision': vision_capable(cfg)})
             for ev in run_agent_stream(cfg, sid, data.get('history') or [],
-                                       text, atts, data.get('company_id')):
+                                       text, atts, data.get('company_id'),
+                                       bool(_slash)):
                 yield sse(ev)
         except GeneratorExit:
             return
