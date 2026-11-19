@@ -4781,7 +4781,10 @@ function pDigits(v){
 }
 
 const PRINT = { list:[], tpl:null, rec:0, sel:-1, scale:1,
+                zoom:'w',           // 'w' 适应宽度（默认）| 'p' 整页 | 数字=固定倍数
+                kw:1, kp:1,
                 timer:null, saving:false, drag:null, loaded:false };
+const P_PXMM = 96 / 25.4;      // 1mm 在 96dpi 下的 CSS 像素数 ≈ 3.7795（别写成 25.4/96，那是 mm/px）
 
 function pAmtSrc(t){
   let fb = null;
@@ -4888,17 +4891,41 @@ function pPlace(el, f, st){
   el.style.top = ((f.y + (st.offy || 0)) - 0.78 * f.size) + 'mm';
   el.style.fontSize = f.size + 'mm';
 }
+/* 预览缩放：'w' 适应宽度 / 'p' 整页 / 数字=固定倍数（1 = 实物大小 1:1） */
+const P_ZOOM_MIN = 0.15, P_ZOOM_MAX = 4;
 function pFit(){
   const wrap = $('.print-stage-wrap'); if(!wrap || !PRINT.tpl) return;
   const {pw, ph} = pPageSize(PRINT.tpl);
-  const PX_PER_MM = 3.7795275;
   const availW = Math.max(260, wrap.clientWidth - 44);
-  const availH = Math.max(280, Math.min(720, (window.innerHeight || 800) - 290));
-  const k = Math.min(availW / (pw * PX_PER_MM), availH / (ph * PX_PER_MM), 1.15);
+  const availH = Math.max(280, Math.min(760, (window.innerHeight || 800) - 300));
+  PRINT.kw = availW / (pw * P_PXMM);
+  PRINT.kp = Math.min(PRINT.kw, availH / (ph * P_PXMM), 1.15);
+  let k = typeof PRINT.zoom === 'number' ? PRINT.zoom
+        : PRINT.zoom === 'p' ? PRINT.kp
+        : Math.min(PRINT.kw, 1.6);                  // 默认适应宽度，最多放大到 1.6 倍免得模糊
+  k = Math.max(P_ZOOM_MIN, Math.min(P_ZOOM_MAX, k));
   PRINT.scale = k;
   const stage = $('#printStage'), box = $('#printStageWrap');
   if(stage) stage.style.transform = 'scale(' + k + ')';
-  if(box){ box.style.width = (pw * PX_PER_MM * k) + 'px'; box.style.height = (ph * PX_PER_MM * k) + 'px'; }
+  if(box){ box.style.width = (pw * P_PXMM * k) + 'px'; box.style.height = (ph * P_PXMM * k) + 'px'; }
+  const pct = $('#printZoomPct');
+  if(pct){
+    const label = typeof PRINT.zoom === 'number' ? Math.round(k * 100) + '%'
+      : (PRINT.zoom === 'p' ? '整页 ' : '适宽 ') + Math.round(k * 100) + '%';
+    pct.textContent = label;
+    pct.title = '点击回到适应宽度';
+  }
+  $$('#printZoomBar button[data-d]').forEach(b => {
+    const d = b.dataset.d;
+    b.classList.toggle('primary', d === PRINT.zoom);
+  });
+}
+function pZoom(d){
+  if(!PRINT.tpl) return;
+  if(d === 'w' || d === 'p') PRINT.zoom = d;
+  else if(d === '100') PRINT.zoom = 1;
+  else PRINT.zoom = Math.max(P_ZOOM_MIN, Math.min(P_ZOOM_MAX, (PRINT.scale || 1) * (d === 'in' ? 1.2 : 1 / 1.2)));
+  pFit();
 }
 
 /* ---- 左侧面板 ---- */
@@ -5025,8 +5052,15 @@ async function renderPrint(){
     </div>
     <div class="print-main">
       <div class="print-bar">
-        <span class="muted small">先在普通纸上试打，与单据叠齐对着灯看，微调后再放正式单据打印。</span>
-        <span class="muted small">打印设置：纸张「自定义」、页边距「无」、缩放「100%」、关闭页眉页脚。</span>
+        <span class="muted small">先普通纸试打，对着灯叠齐看，微调后再放正式单据。打印时纸张选「自定义」、页边距「无」、缩放「100%」。</span>
+        <div id="printZoomBar" class="pz">
+          <button class="btn sm" data-act="pzoom" data-d="out" title="缩小（Ctrl+滚轮）">−</button>
+          <span id="printZoomPct" class="pz-pct" data-act="pzoom" data-d="w" title="点击回到适应宽度">适宽</span>
+          <button class="btn sm" data-act="pzoom" data-d="in" title="放大（Ctrl+滚轮）">＋</button>
+          <span class="pz-sep"></span>
+          <button class="btn sm" data-act="pzoom" data-d="p">整页</button>
+          <button class="btn sm" data-act="pzoom" data-d="100" title="按实际尺寸显示">1:1</button>
+        </div>
       </div>
       <div class="print-stage-wrap">
         <div id="printStageWrap"><div id="printStage">
@@ -5109,6 +5143,16 @@ function pSel(i){
 
 /* ---- 画布指针交互：拖拽定位 + 双击勾选 ---- */
 function pBindStage(){
+  const stageWrap = $('.print-stage-wrap');
+  if(stageWrap && !stageWrap.dataset.zbound){
+    stageWrap.dataset.zbound = '1';
+    // Ctrl/⌘ + 滚轮缩放：鼠标在手边，不用去点按钮
+    stageWrap.addEventListener('wheel', e => {
+      if(S.view !== 'print' || !(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      pZoom(e.deltaY < 0 ? 'in' : 'out');
+    }, {passive: false});
+  }
   const sheet = $('#printSheet');
   if(!sheet || sheet.dataset.bound) return;
   sheet.dataset.bound = '1';
@@ -5156,9 +5200,16 @@ function pBindStage(){
     pQueueSave(); pPaintStage(); pPaintSide();
   });
 }
+/* 窗口尺寸变化后重新算适应比例；固定倍数的不动 */
+let pResizeTimer = null;
+window.addEventListener('resize', () => {
+  if(S.view !== 'print' || !PRINT.tpl) return;
+  clearTimeout(pResizeTimer);
+  pResizeTimer = setTimeout(pFit, 120);
+});
+
 /* 屏幕像素位移 → 页面 mm 位移（考虑旋转与预览缩放） */
-function pPxToMm(dxPx, dyPx){
-  const k = PRINT.scale || 1;
+function pPxToMm(dxPx, dyPx){  const k = PRINT.scale || 1;
   const mmPerPx = 25.4 / 96 / k;
   const rot = PRINT.tpl ? PRINT.tpl.settings.rot : '0';
   const px = dxPx, py = dyPx;
@@ -5234,6 +5285,7 @@ async function pAction(act, el){
     PRINT.tpl = await api('/api/print/templates/' + t.id);
     pPaintSide(); pPaintStage(); return;
   }
+  if(act === 'pzoom'){ pZoom(el.dataset.d); return; }
   if(act === 'psize'){
     const f = PRINT.tpl && PRINT.tpl.fields[PRINT.sel];
     if(!f) return;
