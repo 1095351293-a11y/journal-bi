@@ -7,6 +7,25 @@
 
 ## 2026-11-19
 
+### 9. 独立的「打印模板」工具并入 BI，并且 Agent 能开票
+
+- **现象**：桌面那个 `打印模板.html` 是个单文件工具，5 套票据（澳门支票、香港支票、请款单 A4 横、汇款申请书 A4、中银汇款单 A4）全靠浏览器 localStorage 存，换台机器就没了；AI 看不见也碰不到，想「照这笔支出开一张汇款单」只能手工再录一遍。
+- **原因**：
+  1. 单文件内嵌了 5 张 base64 底图，HTML 1.06MB，每次打开都要解析；模板数据只活在浏览器里，没有服务端。
+  2. 它自带一套 `TPLAgent.exec()` 前端 API（list/create/update/setValues/…），但只能在页面里跑，后端拿不到。
+  3. BI 的 Agent 工具面里完全没有票据这一块。
+- **解决**：
+  - **底图与字段抽出来**：`tools/extract_print_assets.py` 从旧 HTML 里把 5 张底图写成 `static/print-assets/*.jpg`、把 5 套字段定义（8 / 8 / 9 / 20 / 45 个字段，坐标即已校准值）写成 `print_seed/templates.json`。底图走 `/api/print/bg/assets/<file>`，可缓存，页面不再吞 1MB base64。
+  - **服务端存储**（新 `print_tpl.py`）：`data/print/templates/<id>.json` 一套模板一个文件，`data/print/bg/` 存用户上传的底图，首次启动按种子灌入（已有模板则不动，避免覆盖人工校准的坐标）。接口 `GET/POST /api/print/templates`、`GET/PUT/DELETE .../<id>`、`.../records`、`.../values`、`.../fields`、`POST /api/print/bg`、`POST /api/print/import`（吃旧工具 `TPLAgent.export()` 的 JSON，dataURL 底图自动落盘，同名覆盖）。
+  - **金额大写两端一致**：`print_tpl.to_chinese_amount` 与前端 `pWords` 逐字对齐（含「肆角整」这种末位补整规则）；派生字段不落库，读取时按金额来源现算，避免改了金额忘了同步大写。
+  - **前端视图**（`app.js` 的 `renderPrint`）：BI 内新页面「🖨️ 票据打印」，左侧字段面板（值 / 类型 / X / Y / 字号 / 显示开关），右侧画布拖拽定位、双击勾选、A± 调字号；改完 600ms 防抖整份 PUT，状态显示「已保存 hh:mm」。`@page{size:Wmm Hmm;margin:0}` 随纸型动态注入——**缺这条浏览器会按 Letter/A4 出纸，票据必然错位**（第一版就漏了，PDF MeasureBox 直接是 612×792）。
+  - **Agent 工具**（新 `agent_print.py`，9 个）：`list_print_templates` / `get_print_template` / `get_print_record` 只读；`create_print_record`（可传 `from_entry_id`，按字段名关键词把日期、收款人、金额、摘要带进去，对不上的列进 `need_input` 交人补）/ `update_print_record` / `delete_print_record` / `update_print_field` / `create_print_template` / `delete_print_template` 为写。
+  - **权限**：写工具进 `agent.WRITE_NAMES`（只读模式不下发），并复用 `agent_admin._need_confirm` 出审核卡，`module='agent_print'`。四档语义：ask 全部出卡、auto 放行 create/update 但 delete 仍要确认、full 直写。坐标改动单次限幅 ±3mm、字号 ±0.5mm——AI 只有数字，看不出文字是否压到印刷字上。
+  - **打印的边界**：浏览器不允许后台静默出纸，所以不给 Agent「打印」工具。工具返回 `#print/<模板id>/<序号>` 深链接，前端 `agentOpenLink` 新增 `print:` 分支，点开即待打印状态，最后 Ctrl+P 由人按。
+- **涉及**：`print_tpl.py`（新）、`agent_print.py`（新）、`print_seed/templates.json`（新）、`static/print-assets/*.jpg`（新）、`tools/extract_print_assets.py`、`tools/test_print.py`、`tools/test_agent_print.py`（新）、`app.py`、`agent.py`、`static/app.js`、`static/style.css`、`static/index.html`、`.gitignore`
+- **验证**：接口自测 43 项、Agent 工具自测 36 项全通过（副本数据，不碰真实库）；Playwright 实测三种纸型：90×275mm（支票横放顺时针）、210×297mm（A4）、拖拽 40px → 15.5mm 且落库持久、底图上传可用、打印 PDF 无侧栏无底图只有票面文字。
+- **提交**：本次
+
 ### 8. 想用 fsc-boe-extract 这类要跑脚本的技能，还要能 / 调用
 
 - **现象**：① 在 WorkBuddy 里写好的 `fsc-boe-extract`（接管 Edge 抓共享中心报账单）搬不进本系统；② 技能与 MCP 只能点 🧩 弹窗看，弹窗还挡住页面；③ 想在输入框打 `/技能名` 直接调用。

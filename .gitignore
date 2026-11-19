@@ -16,6 +16,7 @@ data/exports/
 data/script_jobs/
 data/imports/
 data/fsc_profile/
+data/print/
 
 # 只保留占位文件，保证 data/ 目录存在
 !data/.gitkeep

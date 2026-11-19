@@ -73,8 +73,8 @@ const modalHead = t => `<div class="modal-title">${t}<button class="modal-close"
 
 /* ============ 导航 ============ */
 const TITLES = {dashboard:'总览看板', journal:'日记账', cash:'现金管理',
-                deposits:'定期存款', tags:'标签管理', orgs:'公司与账户',
-                settings:'设置'};
+                deposits:'定期存款', print:'票据打印', tags:'标签管理',
+                orgs:'公司与账户', settings:'设置'};
 const VIEW_KEY = 'jb.view', CO_KEY = 'jb.company', JR_KEY = 'jb.jr';
 const REM_POP_KEY = 'jb.remPopped';   // 本次会话是否已自动弹过提醒
 const CASH_KEY = 'jb.cashDate';
@@ -123,7 +123,7 @@ function switchView(v, opt){
   }
   viewStateSave();
   return ({dashboard:renderDashboard, journal:renderJournal, cash:renderCash,
-    deposits:renderDeposits, tags:renderTags, orgs:renderOrgs,
+    deposits:renderDeposits, print:renderPrint, tags:renderTags, orgs:renderOrgs,
     settings:renderSettings})[v]();
 }
 /* 账本被改过：把带缓存的数据丢掉再重画当前页 */
@@ -153,15 +153,18 @@ async function refreshAfterWrite(){
 async function boot(){
   await refreshBootstrap();
   bindStatic();
+  pBindPrint();
   agentBindMode();
   await agentLoadMode();
   viewStateRestore();
   S.agent.msgs = agentLoadMsgs();
   await initAgentDock();
   // #journal / #cash 这类锚点可直接打开对应页面；否则回到上次停留的页面
+  // #print/<模板id>/<票据序号> 这种带参数的，取第一段判断页面
   const hash = (location.hash || '').replace('#', '');
+  const hashKey = hash.split('/')[0];
   const last = (()=>{ try{ return localStorage.getItem(VIEW_KEY) || ''; }catch(e){ return ''; } })();
-  const init = TITLES[hash] ? hash : (TITLES[last] ? last : 'dashboard');
+  const init = TITLES[hashKey] ? hashKey : (TITLES[last] ? last : 'dashboard');
   await switchView(init);
   await loadReminders();
   // 待办提醒只在本次会话第一次打开时自动弹一次；之后按 F5 / 自动刷新都不再弹，
@@ -2636,6 +2639,7 @@ function agentLinkHTML(l){
   const t = String(l.target || '');
   const icon = t.startsWith('entry:') ? '📄' : t.startsWith('url:') ? '🌐'
              : t.startsWith('dashboard:') ? '📊' : t.startsWith('deposits:') ? '💰'
+             : t.startsWith('print:') ? '🖨️'
              : t.startsWith('cash:') ? '💵' : '📖';
   return `<button class="agent-link" data-action="agent-link" data-target="${esc(t)}"
     title="点击打开：${esc(t)}">${icon} ${esc(l.label)}</button>`;
@@ -2674,6 +2678,15 @@ async function agentOpenLink(target){
   if(type === 'journal' || type === 'account'){
     const aid = +parts[1];
     if(aid) return agentPeekAccount(aid);
+  }
+  if(type === 'print'){
+    // #print/<模板id>/<票据序号>：Agent 把票据开好后给这个链接，点开就是待打印状态
+    const tid = parts[1] || '';
+    const idx = isNaN(+parts[2]) ? 0 : +parts[2];
+    PRINT.loaded = false;
+    try{ history.replaceState(null, '', '#print/' + tid + '/' + idx); }catch(e){}
+    switchView('print', {nohash:true});
+    return;
   }
   if(type === 'dashboard' || type === 'deposits' || type === 'cash'){
     const cid = +parts[1];
@@ -4710,5 +4723,652 @@ document.addEventListener('change', async e=>{
     else{ let m='恢复失败'; try{ m=(await r.json()).error||m }catch(x){} alert(m); }
   }
 });
+
+/* ==================== 票据打印 ====================
+   原桌面《打印模板.html》并入。模板 / 票据记录 / 字段坐标存服务端（print_tpl.py），
+   这里只管画和改。坐标口径与源工具一致：x/y 单位 mm，**y 是文字基线**，
+   top = y - 0.78*size。改成上边界会让所有已校准的位置整体下移。
+   金额大写算法必须与 print_tpl.py 的 to_chinese_amount 逐字一致。 */
+const P_CN = ['零','壹','贰','叁','肆','伍','陆','柒','捌','玖'];
+const P_U1 = ['','拾','佰','仟'];
+const P_U2 = ['','万','亿','万亿'];
+
+function pIntCn(num){
+  if(num === 0) return '零';
+  const groups = []; let n = num;
+  while(n > 0){ groups.push(n % 10000); n = Math.floor(n/10000); }
+  let result = '';
+  for(let i = groups.length - 1; i >= 0; i--){
+    const g = groups[i];
+    if(g === 0) continue;
+    const s = String(g); let gs = ''; let zero = false;
+    for(let j = 0; j < s.length; j++){
+      const d = +s[j], pos = s.length - 1 - j;
+      if(d === 0){ zero = true; }
+      else { if(zero && gs) gs += '零'; zero = false; gs += P_CN[d] + P_U1[pos]; }
+    }
+    if(result && g < 1000) gs = '零' + gs;
+    result += gs + (P_U2[i] || '');
+  }
+  return result;
+}
+function pWords(v){
+  const s = String(v ?? '').replace(/[^0-9.]/g, '');
+  if(!s) return '';
+  const n = parseFloat(s); if(isNaN(n)) return '';
+  const total = Math.round(n * 100);
+  const yuan = Math.floor(total / 100), jiao = Math.floor(total / 10) % 10, fen = total % 10;
+  let out = '';
+  if(yuan > 0 || (jiao === 0 && fen === 0)) out += pIntCn(yuan) + '元';
+  if(jiao === 0 && fen === 0) out += '整';
+  else{
+    if(jiao > 0) out += P_CN[jiao] + '角';
+    else if(yuan > 0 && fen > 0) out += '零';
+    if(fen > 0) out += P_CN[fen] + '分';
+    if(fen === 0) out += '整';
+  }
+  return out;
+}
+function pFigs(v){
+  const s = String(v ?? '').replace(/[^0-9.]/g, '');
+  if(!s) return '';
+  const n = parseFloat(s); if(isNaN(n)) return '';
+  return n.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+function pDigits(v){
+  return String(v ?? '').replace(/[^0-9]/g, '').split('')
+    .map(d => P_CN[+d]).join('');
+}
+
+const PRINT = { list:[], tpl:null, rec:0, sel:-1, scale:1,
+                timer:null, saving:false, drag:null, loaded:false };
+
+function pAmtSrc(t){
+  let fb = null;
+  for(const f of (t.fields || [])){
+    if(f.autoSrc && !f.auto) return f;
+    if(f.autoSrc && !fb) fb = f;
+  }
+  return fb;
+}
+/* 实际会印出来的值：派生字段现算，不读库里的旧值 */
+function pValues(t, recIdx){
+  const rec = t.records[recIdx ?? t.active] || {values:{}};
+  const raw = rec.values || {};
+  const src = pAmtSrc(t);
+  const srcVal = src ? (raw[src.id] ?? src.def ?? '') : '';
+  const out = {};
+  for(const f of t.fields){
+    let v = raw[f.id];
+    if(v === undefined || v === null) v = f.def || '';
+    if(f.auto === 'words') v = pWords(src ? srcVal : v);
+    else if(f.auto === 'figs') v = pFigs(src ? srcVal : v);
+    else if(f.auto === 'wordsin') v = pDigits(v);
+    out[f.id] = v;
+  }
+  return out;
+}
+function pStatus(msg, bad){
+  const el = $('#printStatus'); if(!el) return;
+  el.textContent = msg || '';
+  el.style.color = bad ? 'var(--red)' : 'var(--muted)';
+}
+function pQueueSave(now){
+  clearTimeout(PRINT.timer);
+  const run = async () => {
+    if(!PRINT.tpl || PRINT.saving) return;
+    PRINT.saving = true; pStatus('保存中…');
+    try{
+      PRINT.tpl.active = PRINT.rec;
+      const t = await api('/api/print/templates/' + PRINT.tpl.id, jsonInit('PUT', PRINT.tpl));
+      PRINT.tpl = t;
+      const d = new Date();
+      pStatus('已保存 ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0'));
+    }catch(e){ pStatus('保存失败：' + e.message, true); }
+    PRINT.saving = false;
+  };
+  if(now) return run();
+  PRINT.timer = setTimeout(run, 600);
+}
+
+function pPageSize(t){
+  const st = t.settings, rot = st.rot;
+  return rot === '0' ? {pw:st.w, ph:st.h} : {pw:st.h, ph:st.w};
+}
+
+/* ---- 画布 ---- */
+function pPaintStage(){
+  const t = PRINT.tpl; if(!t) return;
+  const st = t.settings, rot = st.rot;
+  const {pw, ph} = pPageSize(t);
+  const page = $('#printPage'), sheet = $('#printSheet');
+  if(!page) return;
+  page.style.width = pw + 'mm';
+  page.style.height = ph + 'mm';
+  sheet.style.width = st.w + 'mm';
+  sheet.style.height = st.h + 'mm';
+  sheet.style.transform = rot === '0' ? 'none'
+    : rot === '90cw' ? `translate(${st.h}mm,0) rotate(90deg)`
+    : `translate(0,${st.w}mm) rotate(-90deg)`;
+
+  const bg = $('#printBg');
+  if(t.bg){
+    const url = '/api/print/bg/' + t.bg.split('/').map(encodeURIComponent).join('/');
+    if(bg.getAttribute('data-src') !== url){ bg.src = url; bg.setAttribute('data-src', url); }
+    bg.style.display = st.showbg ? '' : 'none';
+  }else{
+    bg.removeAttribute('src'); bg.style.display = 'none';
+  }
+
+  const vals = pValues(t, PRINT.rec);
+  const old = [...sheet.querySelectorAll('.pf')];
+  old.forEach(n => n.remove());
+  t.fields.forEach((f, i) => {
+    if(!f.on) return;
+    const el = document.createElement('div');
+    el.className = 'pf' + (i === PRINT.sel ? ' sel' : '');
+    el.dataset.i = i;
+    el.textContent = f.kind === 'check' ? (vals[f.id] || '') : (vals[f.id] || '');
+    pPlace(el, f, st);
+    sheet.appendChild(el);
+  });
+  const stl = $('#printPageStyle');
+  if(stl){ stl.textContent = `@page{size:${pw}mm ${ph}mm;margin:0}`; }
+  else{
+    // 打印纸张尺寸必须靠 @page 声明，缺了它浏览器按 Letter/A4 出纸，票据必然错位
+    const s = document.createElement('style');
+    s.id = 'printPageStyle';
+    s.textContent = `@page{size:${pw}mm ${ph}mm;margin:0}`;
+    document.head.appendChild(s);
+  }
+  pFit();
+}
+function pPlace(el, f, st){
+  el.style.left = (f.x + (st.offx || 0)) + 'mm';
+  el.style.top = ((f.y + (st.offy || 0)) - 0.78 * f.size) + 'mm';
+  el.style.fontSize = f.size + 'mm';
+}
+function pFit(){
+  const wrap = $('.print-stage-wrap'); if(!wrap || !PRINT.tpl) return;
+  const {pw, ph} = pPageSize(PRINT.tpl);
+  const PX_PER_MM = 3.7795275;
+  const availW = Math.max(260, wrap.clientWidth - 44);
+  const availH = Math.max(280, Math.min(720, (window.innerHeight || 800) - 290));
+  const k = Math.min(availW / (pw * PX_PER_MM), availH / (ph * PX_PER_MM), 1.15);
+  PRINT.scale = k;
+  const stage = $('#printStage'), box = $('#printStageWrap');
+  if(stage) stage.style.transform = 'scale(' + k + ')';
+  if(box){ box.style.width = (pw * PX_PER_MM * k) + 'px'; box.style.height = (ph * PX_PER_MM * k) + 'px'; }
+}
+
+/* ---- 左侧面板 ---- */
+function pPaintSide(){
+  const t = PRINT.tpl; if(!t) return;
+  const sel = $('#printTplSel');
+  if(sel){
+    sel.innerHTML = PRINT.list.map(x =>
+      `<option value="${x.id}" ${x.id === t.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('');
+  }
+  const nm = $('#printTplName'); if(nm && document.activeElement !== nm) nm.value = t.name;
+  const amtId = (pAmtSrc(t) || {}).id;
+  const rs = $('#printRecSel');
+  if(rs){
+    rs.innerHTML = t.records.map((r, i) => {
+      const v = amtId ? String((r.values || {})[amtId] || '').replace(/[^0-9.,]/g, '') : '';
+      return `<option value="${i}" ${i === PRINT.rec ? 'selected' : ''}>${esc(r.name)}${v ? '  ·  ' + esc(v) : ''}</option>`;
+    }).join('');
+  }
+  const rn = $('#printRecName');
+  if(rn && document.activeElement !== rn) rn.value = t.records[PRINT.rec]?.name || '';
+  const st = t.settings;
+  const setV = (id, v) => { const el = $('#' + id); if(el && document.activeElement !== el) el.value = v; };
+  setV('printW', st.w); setV('printH', st.h); setV('printOffX', st.offx); setV('printOffY', st.offy);
+  const rot = $('#printRot'); if(rot) rot.value = st.rot;
+  const bgc = $('#printShowBg'); if(bgc) bgc.checked = st.showbg;
+
+  const vals = pValues(t, PRINT.rec);
+  const box = $('#printFields');
+  if(!box) return;
+  box.innerHTML = t.fields.map((f, i) => {
+    const typeVal = f.kind === 'check' ? 'check' : f.autoSrc ? 'src'
+      : (f.auto === 'words' ? 'words' : f.auto === 'figs' ? 'figs'
+      : f.auto === 'wordsin' ? 'wordsin' : 'text');
+    const auto = (f.auto === 'words' || f.auto === 'figs');
+    const ro = auto ? ' readonly' : '';
+    let valCtl;
+    if(f.kind === 'check'){
+      valCtl = `<label class="plf-chk"><input type="checkbox" data-k="val" data-i="${i}"
+        ${vals[f.id] ? 'checked' : ''}> 打勾</label>`;
+    }else{
+      const shown = f.auto === 'wordsin'
+        ? ((t.records[PRINT.rec]?.values || {})[f.id] ?? '')
+        : (vals[f.id] || '');
+      valCtl = `<input class="inp" data-k="val" data-i="${i}" value="${esc(shown)}"${ro}
+        placeholder="${auto ? '自动生成' : '内容'}">`;
+    }
+    return `<div class="plf${i === PRINT.sel ? ' sel' : ''}" data-i="${i}">
+      <div class="plf-top">
+        <input type="checkbox" data-k="on" data-i="${i}" ${f.on ? 'checked' : ''} title="显示/隐藏">
+        <input class="plf-name" data-k="name" data-i="${i}" value="${esc(f.name)}">
+        <button class="btn sm" data-k="fx" data-i="${i}" title="只在画布上选中">◎</button>
+      </div>
+      <div class="plf-mid">${valCtl}
+        <select class="plf-type" data-k="type" data-i="${i}">
+          <option value="text">文本</option>
+          <option value="check">勾选</option>
+          <option value="src">金额来源</option>
+          <option value="words">大写(自动)</option>
+          <option value="figs">小写(自动)</option>
+          <option value="wordsin">数字→大写</option>
+        </select>
+      </div>
+      <div class="plf-xy">
+        <label>X<input type="number" step="0.5" data-k="x" data-i="${i}" value="${f.x}"></label>
+        <label>Y<input type="number" step="0.5" data-k="y" data-i="${i}" value="${f.y}"></label>
+        <label>字号<input type="number" step="0.1" data-k="size" data-i="${i}" value="${f.size}"></label>
+        <button class="btn sm danger" data-k="del" data-i="${i}" title="删除字段">×</button>
+      </div>
+    </div>`;
+  }).join('') || '<div class="muted small" style="padding:10px 4px">这套模板还没有字段，点下面「+ 字段」添加。</div>';
+}
+
+async function renderPrint(){
+  $('#content').innerHTML = `
+  <div class="print-wrap">
+    <div class="print-side">
+      <div class="pc-head">
+        <select id="printTplSel" class="inp"></select>
+        <button class="btn sm" data-act="ptpl-new" title="新建模板">＋</button>
+        <button class="btn sm danger" data-act="ptpl-del" title="删除模板">✕</button>
+      </div>
+      <input id="printTplName" class="inp pc-name" placeholder="模板名称" data-act="ptpl-rename">
+      <div class="pc-head">
+        <select id="printRecSel" class="inp"></select>
+        <button class="btn sm" data-act="prec-new" title="新建票据">＋</button>
+        <button class="btn sm" data-act="prec-dup" title="复制当前票据">⧉</button>
+        <button class="btn sm danger" data-act="prec-del" title="删除票据">✕</button>
+      </div>
+      <input id="printRecName" class="inp pc-name" placeholder="当前票据名称" data-act="prec-rename">
+      <div class="pc-tools">
+        <button class="btn sm" data-act="pbg">上传底图</button>
+        <button class="btn sm" data-act="pexport">导出</button>
+        <button class="btn sm" data-act="pimport">导入</button>
+        <button class="btn sm primary" data-act="pprint">🖨 打印</button>
+      </div>
+      <div class="pc-geo">
+        <label>纸宽<input id="printW" type="number" step="0.5" data-geo="w"></label>
+        <label>纸高<input id="printH" type="number" step="0.5" data-geo="h"></label>
+        <label>上下<input id="printOffY" type="number" step="0.5" data-geo="offy"></label>
+        <label>左右<input id="printOffX" type="number" step="0.5" data-geo="offx"></label>
+      </div>
+      <div class="pc-geo">
+        <label style="flex:1">进纸
+          <select id="printRot" data-geo="rot">
+            <option value="90cw">横放·顺时针 90°</option>
+            <option value="90ccw">横放·逆时针 90°</option>
+            <option value="0">竖放·不旋转</option>
+          </select>
+        </label>
+        <label class="pc-chk"><input type="checkbox" id="printShowBg" data-geo="showbg"> 显示底图</label>
+      </div>
+      <div class="pc-fields-head">
+        <b>字段</b><span class="muted small" id="printStatus"></span>
+      </div>
+      <div id="printFields" class="pc-fields"></div>
+      <div class="pc-foot">
+        <button class="btn sm" data-act="pfield-add">+ 字段</button>
+        <button class="btn sm" data-act="pfield-check">+ 勾选 ✔</button>
+        <span class="muted small" style="margin-left:auto">拖动画布上的文字可调位置</span>
+      </div>
+      <input type="file" id="printBgFile" accept="image/*" hidden>
+      <input type="file" id="printImpFile" accept=".json,application/json" hidden>
+    </div>
+    <div class="print-main">
+      <div class="print-bar">
+        <span class="muted small">先在普通纸上试打，与单据叠齐对着灯看，微调后再放正式单据打印。</span>
+        <span class="muted small">打印设置：纸张「自定义」、页边距「无」、缩放「100%」、关闭页眉页脚。</span>
+      </div>
+      <div class="print-stage-wrap">
+        <div id="printStageWrap"><div id="printStage">
+          <div id="printPage"><div id="printSheet">
+            <img id="printBg" alt="">
+          </div></div>
+        </div></div>
+      </div>
+      <div class="print-hint" id="printSelBar"></div>
+    </div>
+  </div>`;
+
+  if(!PRINT.loaded) await pLoad();
+  else { pPaintSide(); pPaintStage(); }
+  pBindStage();
+}
+
+async function pLoad(tid, recIdx){
+  let data;
+  try{ data = await api('/api/print/templates'); }
+  catch(e){ $('#content').innerHTML = `<div class="card">模板接口不可用：${esc(e.message)}</div>`; return; }
+  PRINT.list = data.items || [];
+  const hash = (location.hash || '').replace('#', '');
+  let want = tid || '';
+  if(!want && hash.startsWith('print/')){
+    const p = hash.split('/');
+    want = p[1] || '';
+    if(p[2] !== undefined && p[2] !== '') recIdx = +p[2];
+  }
+  if(!want){ try{ want = localStorage.getItem('jb.printTpl') || ''; }catch(e){} }
+  if(!want || !PRINT.list.some(x => x.id === want)) want = (PRINT.list[0] || {}).id;
+  if(!want){
+    $('#content').innerHTML = '<div class="card">还没有任何模板。点左侧「＋」新建一套，或从旧版工具「导出」后在这里「导入」。</div>';
+    return;
+  }
+  PRINT.tpl = await api('/api/print/templates/' + want);
+  PRINT.rec = (typeof recIdx === 'number' && recIdx >= 0 && recIdx < PRINT.tpl.records.length)
+    ? recIdx : PRINT.tpl.active;
+  PRINT.sel = -1;
+  PRINT.loaded = true;
+  try{ localStorage.setItem('jb.printTpl', PRINT.tpl.id); }catch(e){}
+  pPaintSide(); pPaintStage();
+}
+
+/* 切换模板 / 记录 */
+async function pSwitchTpl(id){
+  if(!id || (PRINT.tpl && id === PRINT.tpl.id)) return;
+  await pQueueSave(true);
+  PRINT.sel = -1;
+  PRINT.tpl = await api('/api/print/templates/' + id);
+  PRINT.rec = PRINT.tpl.active;
+  try{ localStorage.setItem('jb.printTpl', id); }catch(e){}
+  try{ history.replaceState(null, '', '#print/' + id + '/' + PRINT.rec); }catch(e){}
+  pPaintSide(); pPaintStage();
+}
+async function pSwitchRec(i){
+  if(!PRINT.tpl || i < 0 || i >= PRINT.tpl.records.length || i === PRINT.rec) return;
+  await pQueueSave(true);
+  PRINT.rec = i;
+  PRINT.tpl.active = i;
+  try{ history.replaceState(null, '', '#print/' + PRINT.tpl.id + '/' + i); }catch(e){}
+  pPaintSide(); pPaintStage();
+}
+
+function pSel(i){
+  PRINT.sel = i;
+  $$('#printSheet .pf').forEach(n => n.classList.toggle('sel', +n.dataset.i === i));
+  $$('#printFields .plf').forEach(n => n.classList.toggle('sel', +n.dataset.i === i));
+  const bar = $('#printSelBar');
+  if(!bar) return;
+  const f = PRINT.tpl && PRINT.tpl.fields[i];
+  if(!f){ bar.innerHTML = ''; return; }
+  const auto = (f.auto === 'words' || f.auto === 'figs');
+  bar.innerHTML = `已选中 <b>${esc(f.name)}</b>
+    <span class="muted">（X ${f.x} / Y ${f.y} / 字号 ${f.size}mm）</span>
+    ${auto ? '<span class="muted">自动生成，位置仍可拖</span>' : ''}
+    <button class="btn sm" data-act="psize" data-d="-0.2">A−</button>
+    <button class="btn sm" data-act="psize" data-d="0.2">A＋</button>`;
+}
+
+/* ---- 画布指针交互：拖拽定位 + 双击勾选 ---- */
+function pBindStage(){
+  const sheet = $('#printSheet');
+  if(!sheet || sheet.dataset.bound) return;
+  sheet.dataset.bound = '1';
+  sheet.addEventListener('pointerdown', e => {
+    const el = e.target.closest('.pf');
+    if(!el){ pSel(-1); return; }
+    if(!PRINT.tpl) return;
+    e.preventDefault();
+    const i = +el.dataset.i, f = PRINT.tpl.fields[i];
+    if(!f) return;
+    pSel(i);
+    PRINT.drag = {i, sx:e.clientX, sy:e.clientY, x0:f.x, y0:f.y};
+    el.classList.add('drag');
+    try{ el.setPointerCapture(e.pointerId); }catch(_){}
+  });
+  sheet.addEventListener('pointermove', e => {
+    const d = PRINT.drag; if(!d) return;
+    const f = PRINT.tpl.fields[d.i]; if(!f) return;
+    const mm = pPxToMm(e.clientX - d.sx, e.clientY - d.sy);
+    f.x = Math.round((d.x0 + mm.dx) * 10) / 10;
+    f.y = Math.round((d.y0 + mm.dy) * 10) / 10;
+    const el = sheet.querySelector(`.pf[data-i="${d.i}"]`);
+    if(el) pPlace(el, f, PRINT.tpl.settings);
+    const xi = $(`#printFields [data-k="x"][data-i="${d.i}"]`);
+    const yi = $(`#printFields [data-k="y"][data-i="${d.i}"]`);
+    if(xi) xi.value = f.x;
+    if(yi) yi.value = f.y;
+    pQueueSave();
+  });
+  const end = () => {
+    if(!PRINT.drag) return;
+    const d = PRINT.drag; PRINT.drag = null;
+    const el = sheet.querySelector(`.pf[data-i="${d.i}"]`);
+    if(el) el.classList.remove('drag');
+    pQueueSave(true);
+  };
+  sheet.addEventListener('pointerup', end);
+  sheet.addEventListener('pointercancel', end);
+  sheet.addEventListener('dblclick', e => {
+    const el = e.target.closest('.pf'); if(!el || !PRINT.tpl) return;
+    const f = PRINT.tpl.fields[+el.dataset.i];
+    if(!f || f.kind !== 'check') return;
+    const rec = PRINT.tpl.records[PRINT.rec];
+    rec.values[f.id] = rec.values[f.id] ? '' : '✔';
+    pQueueSave(); pPaintStage(); pPaintSide();
+  });
+}
+/* 屏幕像素位移 → 页面 mm 位移（考虑旋转与预览缩放） */
+function pPxToMm(dxPx, dyPx){
+  const k = PRINT.scale || 1;
+  const mmPerPx = 25.4 / 96 / k;
+  const rot = PRINT.tpl ? PRINT.tpl.settings.rot : '0';
+  const px = dxPx, py = dyPx;
+  if(rot === '0') return {dx:px * mmPerPx, dy:py * mmPerPx};
+  if(rot === '90cw') return {dx:py * mmPerPx, dy:-px * mmPerPx};
+  return {dx:-py * mmPerPx, dy:px * mmPerPx};
+}
+
+/* ---- 事件 ---- */
+async function pAction(act, el){
+  const t = PRINT.tpl;
+  if(act === 'ptpl-new'){
+    const nt = await jpost('/api/print/templates', {
+      name: '模板 ' + (PRINT.list.length + 1),
+      settings: {w:275, h:90, offx:0, offy:0, rot:'90cw', showbg:true}
+    });
+    PRINT.loaded = false; await pLoad(nt.id); return;
+  }
+  if(act === 'ptpl-del'){
+    if(!t) return;
+    if(PRINT.list.length <= 1){ alert('至少保留一套模板。'); return; }
+    if(!confirm(`删除模板「${t.name}」？底图、布局和它的所有票据记录都会一起删掉。`)) return;
+    await jdel('/api/print/templates/' + t.id);
+    PRINT.loaded = false; await pLoad(); return;
+  }
+  if(act === 'prec-new'){
+    if(!t) return;
+    await pQueueSave(true);
+    const r = await jpost(`/api/print/templates/${t.id}/records`, {name:'票据 ' + (t.records.length + 1), values:{}});
+    PRINT.tpl = await api('/api/print/templates/' + t.id);
+    PRINT.rec = r.index; pPaintSide(); pPaintStage(); return;
+  }
+  if(act === 'prec-dup'){
+    if(!t) return;
+    await pQueueSave(true);
+    const cur = PRINT.tpl.records[PRINT.rec];
+    const r = await jpost(`/api/print/templates/${t.id}/records`,
+      {name: (cur.name || '票据') + '(副本)', values: cur.values || {}});
+    PRINT.tpl = await api('/api/print/templates/' + t.id);
+    PRINT.rec = r.index; pPaintSide(); pPaintStage(); return;
+  }
+  if(act === 'prec-del'){
+    if(!t) return;
+    if(t.records.length <= 1){ alert('至少保留一条票据。'); return; }
+    if(!confirm(`删除「${t.records[PRINT.rec].name}」？`)) return;
+    await jdel(`/api/print/templates/${t.id}/records/${PRINT.rec}`);
+    PRINT.tpl = await api('/api/print/templates/' + t.id);
+    PRINT.rec = PRINT.tpl.active; pPaintSide(); pPaintStage(); return;
+  }
+  if(act === 'pbg'){ $('#printBgFile').click(); return; }
+  if(act === 'pexport'){
+    const all = [];
+    for(const x of PRINT.list) all.push(await api('/api/print/templates/' + x.id));
+    const blob = new Blob([JSON.stringify({v:2, templates:all}, null, 1)], {type:'application/json'});
+    const a = document.createElement('a');
+    const d = new Date();
+    a.href = URL.createObjectURL(blob);
+    a.download = `票据模板_${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}.json`;
+    document.body.appendChild(a); a.click();
+    setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 800);
+    return;
+  }
+  if(act === 'pimport'){ $('#printImpFile').click(); return; }
+  if(act === 'pprint'){ pPrintNow(); return; }
+  if(act === 'pfield-add' || act === 'pfield-check'){
+    if(!t) return;
+    const isCheck = act === 'pfield-check';
+    await pQueueSave(true);
+    await jpost(`/api/print/templates/${t.id}/fields`, {
+      name: isCheck ? '勾选' : '新字段', x:20, y:20, size: isCheck ? 3.6 : 3.2,
+      kind: isCheck ? 'check' : null, def: isCheck ? '✔' : ''
+    });
+    PRINT.tpl = await api('/api/print/templates/' + t.id);
+    pPaintSide(); pPaintStage(); return;
+  }
+  if(act === 'psize'){
+    const f = PRINT.tpl && PRINT.tpl.fields[PRINT.sel];
+    if(!f) return;
+    const d = parseFloat(el.dataset.d) || 0;
+    f.size = Math.min(30, Math.max(1, Math.round((f.size + d) * 10) / 10));
+    pQueueSave(); pPaintStage(); pPaintSide(); return;
+  }
+}
+
+function pPrintNow(){
+  const t = PRINT.tpl; if(!t) return;
+  pQueueSave(true);
+  const {pw, ph} = pPageSize(t);
+  let stl = $('#printPageStyle');
+  if(!stl){ stl = document.createElement('style'); stl.id = 'printPageStyle'; document.head.appendChild(stl); }
+  stl.textContent = `@page{size:${pw}mm ${ph}mm;margin:0}`;
+  setTimeout(() => window.print(), 150);
+}
+
+function pOnFieldEdit(e){
+  const el = e.target.closest('[data-k]');
+  if(!el || !PRINT.tpl) return;
+  const k = el.dataset.k, i = +el.dataset.i;
+  const t = PRINT.tpl, f = t.fields[i];
+  if(!f) return;
+  const rec = t.records[PRINT.rec] || (t.records[PRINT.rec] = {name:'票据', values:{}});
+  if(!rec.values) rec.values = {};
+  if(k === 'on'){ f.on = el.checked; pQueueSave(); pPaintStage(); pPaintSide(); }
+  else if(k === 'name'){ f.name = el.value; pQueueSave(); pPaintStage(); }
+  else if(k === 'val'){
+    if(f.kind === 'check') rec.values[f.id] = el.checked ? '✔' : '';
+    else rec.values[f.id] = el.value;
+    pQueueSave(); pPaintStage();
+  }
+  else if(k === 'x'){ f.x = parseFloat(el.value) || 0; pQueueSave(); pPaintStage(); }
+  else if(k === 'y'){ f.y = parseFloat(el.value) || 0; pQueueSave(); pPaintStage(); }
+  else if(k === 'size'){ f.size = parseFloat(el.value) || 3; pQueueSave(); pPaintStage(); }
+  else if(k === 'fx'){ pSel(i); }
+  else if(k === 'type'){
+    const v = el.value;
+    f.kind = v === 'check' ? 'check' : null;
+    f.auto = null; f.autoSrc = false;
+    if(v === 'src') f.autoSrc = true;
+    else if(v === 'words') f.auto = 'words';
+    else if(v === 'figs') f.auto = 'figs';
+    else if(v === 'wordsin') f.auto = 'wordsin';
+    if(v === 'check' && !rec.values[f.id]) rec.values[f.id] = '✔';
+    if(f.autoSrc) t.fields.forEach(o => { if(o !== f) o.autoSrc = false; });
+    pQueueSave(true); pPaintSide(); pPaintStage();
+  }
+  else if(k === 'del'){
+    if(!confirm(`删除字段「${f.name}」？`)) return;
+    (async () => {
+      await pQueueSave(true);
+      await jdel(`/api/print/templates/${t.id}/fields/${f.id}`);
+      PRINT.tpl = await api('/api/print/templates/' + t.id);
+      PRINT.sel = -1; pPaintSide(); pPaintStage();
+    })();
+  }
+}
+
+function pBindPrint(){
+  const content = $('#content');
+  if(!content || content.dataset.pbound) return;
+  content.dataset.pbound = '1';
+  content.addEventListener('input', e => {
+    if(S.view !== 'print') return;
+    if(e.target.closest('#printFields')) return pOnFieldEdit(e);
+    if(e.target.id === 'printTplName'){
+      if(PRINT.tpl){ PRINT.tpl.name = e.target.value; pQueueSave(); pPaintSide(); }
+      return;
+    }
+    if(e.target.id === 'printRecName'){
+      if(PRINT.tpl){
+        const r = PRINT.tpl.records[PRINT.rec];
+        if(r){ r.name = e.target.value; pQueueSave(); pPaintSide(); }
+      }
+      return;
+    }
+    const geo = e.target.dataset.geo;
+    if(geo && PRINT.tpl){
+      const st = PRINT.tpl.settings;
+      if(geo === 'rot') st.rot = e.target.value;
+      else if(geo === 'showbg') st.showbg = e.target.checked;
+      else st[geo] = parseFloat(e.target.value) || 0;
+      pQueueSave(); pPaintStage();
+    }
+  });
+  content.addEventListener('change', async e => {
+    if(S.view !== 'print') return;
+    if(e.target.id === 'printTplSel') return void pSwitchTpl(e.target.value);
+    if(e.target.id === 'printRecSel') return void pSwitchRec(+e.target.value);
+    if(e.target.id === 'printRot'){
+      if(PRINT.tpl){ PRINT.tpl.settings.rot = e.target.value; pQueueSave(); pPaintStage(); }
+      return;
+    }
+    if(e.target.id === 'printShowBg'){
+      if(PRINT.tpl){ PRINT.tpl.settings.showbg = e.target.checked; pQueueSave(); pPaintStage(); }
+      return;
+    }
+    if(e.target.id === 'printBgFile' && e.target.files.length){
+      const fd = new FormData();
+      fd.append('file', e.target.files[0]);
+      try{
+        const r = await fetch('/api/print/bg', {method:'POST', body:fd});
+        if(!r.ok) throw new Error('上传失败');
+        const d = await r.json();
+        PRINT.tpl.bg = d.bg;
+        pQueueSave(true); pPaintStage();
+      }catch(err){ alert('底图上传失败：' + err.message); }
+      e.target.value = '';
+      return;
+    }
+    if(e.target.id === 'printImpFile' && e.target.files.length){
+      try{
+        const txt = await e.target.files[0].text();
+        const d = JSON.parse(txt);
+        const r = await jpost('/api/print/import', {templates: d.templates || d, mode:'merge'});
+        alert(`已导入 ${r.count} 套模板（同名覆盖）。`);
+        PRINT.loaded = false; await pLoad();
+      }catch(err){ alert('导入失败：' + err.message); }
+      e.target.value = '';
+      return;
+    }
+    if(e.target.closest('#printFields')) return pOnFieldEdit(e);
+    const geo = e.target.dataset.geo;
+    if(geo === 'rot' && PRINT.tpl){
+      PRINT.tpl.settings.rot = e.target.value; pQueueSave(); pPaintStage();
+    }
+  });
+  content.addEventListener('click', e => {
+    if(S.view !== 'print') return;
+    const b = e.target.closest('[data-act]');
+    if(b) pAction(b.dataset.act, b);
+  });
+}
 
 boot();

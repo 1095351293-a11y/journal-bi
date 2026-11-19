@@ -855,6 +855,16 @@ try:
 except Exception as _e:
     print('[agent] 脚本执行工具未加载:', _e)
 
+# 票据打印：查模板 / 填票据 / 微调坐标（导出 PDF 不做，打印必须人点）
+try:
+    from agent_print import (IMPL as PRINT_IMPL, LABELS as PRINT_LABELS,
+                             TOOLS as PRINT_TOOLS)
+    TOOLS.extend(PRINT_TOOLS)
+    TOOL_IMPL.update(PRINT_IMPL)
+    TOOL_LABEL.update(PRINT_LABELS)
+except Exception as _e:
+    print('[agent] 票据打印工具未加载:', _e)
+
 # 这些工具会改账本或系统结构：查询轮次不给它们，写成功才标脏
 # propose_merge_entries 之前漏在这里，导致合并后不触发 sess_mark_dirty、
 # 纯查询轮次也会把它挂上来。合并是写操作，必须归位。
@@ -865,7 +875,10 @@ WRITE_NAMES = {'propose_entry', 'propose_update_entry', 'propose_update_entries'
                'manage_deposit', 'set_exchange_rates', 'manage_cash_count',
                'delete_attachment', 'backup_now',
                # 跑脚本 = 这台机器上真的起进程，只读模式一定不能下发
-               'run_script', 'check_script'}
+               'run_script', 'check_script',
+               # 票据打印：填单、删单、挪坐标都算写
+               'create_print_record', 'update_print_record', 'delete_print_record',
+               'update_print_field', 'create_print_template', 'delete_print_template'}
 
 SYSTEM_PROMPT = """你是「日记账 BI 系统」内置的查账助手，服务对象是企业的财务人员。
 
@@ -893,6 +906,18 @@ SYSTEM_PROMPT = """你是「日记账 BI 系统」内置的查账助手，服务
 - 明细用 Markdown 表格（不超过 10 行，多了先汇总），数字右对齐、两位小数、带千分位和币种。
 - 金额较大或异常时，主动点出风险（如某笔占当月支出 40%、有未兑现支票、定期即将到期）。
 - 结尾可给一句可执行的建议，但不要长篇大论。
+
+## 票据打印（支票 / 汇款单 / 请款单）
+- 顺序固定：`list_print_templates` → `get_print_template`（拿准确字段名）→ `create_print_record`。
+- 用户是就某笔支出开单时，传 `from_entry_id`，系统会把日期、收款人、金额、摘要自动带进去；
+  返回里的 `need_input` 就是流水里没有、需要人补的字段，要如实列出来，别自己编。
+- 金额大写 / 小写是**自动字段**，不要手工填，填了也会被覆盖。
+- 开好后把链接写成文字：`[中银汇款单 10,000 审计费](#print:模板id:序号)`，
+  target 原样抄工具返回的 `link`（去掉开头的 # 就是 `print:...` 形式）。
+- **打印必须人来点**：浏览器不允许后台静默出纸。告诉用户「点链接打开后 Ctrl+P」，
+  不要承诺「已经打印好了」。
+- 调坐标（`update_print_field`）只用于 1–3mm 的微调。整体错位、换打印机导致的偏移，
+  让用户在画布上直接拖 —— AI 只有数字，看不出文字是否压到印刷字上。
 
 今天是 {today}。当前系统默认公司：{company}。
 """

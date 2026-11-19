@@ -46,6 +46,10 @@ app.register_blueprint(agent_write_bp)
 from agent_core import bp as agent_core_bp  # noqa: E402
 app.register_blueprint(agent_core_bp)
 
+# 票据打印模板（原「打印模板.html」独立工具并入）：模板/记录/底图的增删改查
+from print_tpl import bp as print_bp  # noqa: E402
+app.register_blueprint(print_bp, url_prefix='/api/print')
+
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS companies(
   id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, sort INTEGER DEFAULT 0);

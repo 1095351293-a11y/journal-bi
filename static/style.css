@@ -834,3 +834,81 @@ body.agent-open.side-open #main{margin-right:calc(var(--agent-w) + 210px)}
 .ag-kind{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;
   background:var(--blue-soft);color:var(--blue);font-weight:600;vertical-align:middle}
 .ag-kind.guide{background:#fef3c7;color:#b45309}
+
+/* ---------- 票据打印 ---------- */
+.print-wrap{display:flex;gap:14px;align-items:flex-start}
+.print-side{flex:0 0 372px;width:372px;background:var(--card);border:1px solid var(--line);
+  border-radius:12px;padding:12px;position:sticky;top:78px;max-height:calc(100vh - 96px);
+  display:flex;flex-direction:column;gap:8px}
+.print-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:10px}
+.pc-head{display:flex;gap:6px;align-items:center}
+.pc-head .inp{flex:1;min-width:0}
+.pc-name{width:100%;font-size:13px}
+.pc-tools{display:flex;gap:6px;flex-wrap:wrap}
+.pc-geo{display:flex;gap:8px;flex-wrap:wrap;align-items:center;font-size:11.5px;color:var(--muted)}
+.pc-geo label{display:flex;align-items:center;gap:4px}
+.pc-geo input[type=number]{width:56px;border:1px solid var(--line);border-radius:6px;
+  padding:3px 5px;font-size:12px;text-align:center}
+.pc-geo select{flex:1;min-width:0;padding:4px 6px;font-size:12px;border-radius:6px}
+.pc-chk{gap:5px!important;cursor:pointer}
+.pc-fields-head{display:flex;align-items:baseline;gap:8px;padding-top:6px;
+  border-top:1px solid var(--line);font-size:13px}
+.pc-fields{flex:1;overflow:auto;padding-right:2px;margin:0 -2px}
+.pc-foot{display:flex;gap:6px;align-items:center;padding-top:6px;border-top:1px solid var(--line)}
+.plf{border:1px solid var(--line);border-radius:8px;padding:6px 8px;margin-bottom:6px;background:#fff}
+.plf.sel{border-color:#6d4aff;background:#faf8ff;box-shadow:0 0 0 2px rgba(109,74,255,.1)}
+.plf-top{display:flex;gap:6px;align-items:center}
+.plf-name{flex:1;min-width:0;border:1px solid var(--line);border-radius:6px;
+  padding:3px 6px;font-size:12px;font-family:inherit}
+.plf-mid{display:flex;gap:6px;margin-top:5px}
+.plf-mid .inp{flex:1;min-width:0;padding:4px 8px;font-size:12.5px}
+.plf-type{flex:0 0 100px;padding:3px 4px;font-size:12px;border-radius:6px}
+.plf-chk{display:flex;align-items:center;gap:5px;font-size:13px;color:var(--txt);cursor:pointer;flex:1}
+.plf-xy{display:flex;gap:6px;margin-top:5px;align-items:center;font-size:11px;color:var(--muted)}
+.plf-xy label{display:flex;align-items:center;gap:3px}
+.plf-xy input{width:52px;border:1px solid var(--line);border-radius:5px;
+  padding:2px 4px;font-size:11.5px;text-align:center;font-family:inherit}
+.plf-xy .btn{margin-left:auto}
+.print-bar{display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap}
+.print-stage-wrap{background:#eef1f5;border:1px solid var(--line);border-radius:12px;
+  padding:16px;min-height:440px;overflow:auto;display:flex;justify-content:center;align-items:flex-start}
+#printStageWrap{position:relative;flex:0 0 auto}
+#printStage{position:absolute;top:0;left:0;transform-origin:top left}
+#printPage{position:relative;background:#fff;border:1px dashed #c3ccd8;
+  box-shadow:0 2px 14px rgba(0,0,0,.13);overflow:hidden}
+#printSheet{position:absolute;top:0;left:0;background:#fff;transform-origin:top left}
+#printBg{position:absolute;left:0;top:0;width:100%;height:100%;opacity:.45;
+  pointer-events:none;object-fit:fill}
+.pf{position:absolute;white-space:nowrap;line-height:1;color:#111;cursor:grab;
+  border:1px dashed transparent;border-radius:2px;padding:1px 2px;
+  user-select:none;-webkit-user-select:none;touch-action:none;
+  font-family:"Microsoft YaHei","SimSun",sans-serif}
+.pf:hover{border-color:#6d4aff;background:rgba(109,74,255,.04)}
+.pf.sel{border-color:#6d4aff;background:rgba(109,74,255,.09)}
+.pf.drag{cursor:grabbing}
+.print-hint{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--muted);
+  background:var(--card);border:1px solid var(--line);border-radius:10px;padding:6px 12px;min-height:34px}
+
+@media (max-width:1180px){
+  .print-wrap{flex-direction:column}
+  .print-side{flex:none;width:100%;position:static;max-height:none}
+  .pc-fields{max-height:300px}
+}
+
+/* 打印：只留单据画布，去掉预览缩放与虚线框 */
+@media print{
+  #sidebar,#topbar,#agentDock,#agentFab,#agentMask,#modalOverlay,
+  .print-side,.print-bar,.print-hint,#printBg{display:none!important}
+  html,body{background:#fff!important;height:auto!important;overflow:visible!important}
+  #app{display:block!important;min-height:0!important}
+  #main{display:block!important}
+  #content{padding:0!important;overflow:visible!important}
+  .print-wrap{display:block!important}
+  .print-main{display:block!important}
+  .print-stage-wrap{display:block!important;padding:0!important;border:0!important;
+    background:#fff!important;overflow:visible!important;min-height:0!important}
+  #printStageWrap{width:auto!important;height:auto!important;margin:0!important}
+  #printStage{position:static!important;transform:none!important}
+  #printPage{border:0!important;box-shadow:none!important;margin:0!important}
+  .pf{border:0!important;padding:0!important;background:none!important}
+}

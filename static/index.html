@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>日记账 BI 系统</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="style.css?v=2.13.0">
+<link rel="stylesheet" href="style.css?v=2.14.0">
 </head>
 <body>
 <div id="app">
@@ -25,6 +25,7 @@
       <button class="nav-btn" data-action="nav" data-view="journal">📖 日记账</button>
       <button class="nav-btn" data-action="nav" data-view="cash">💵 现金管理</button>
       <button class="nav-btn" data-action="nav" data-view="deposits">💰 定期存款</button>
+      <button class="nav-btn" data-action="nav" data-view="print">🖨️ 票据打印</button>
       <button class="nav-btn" data-action="nav" data-view="tags">🏷️ 标签管理</button>
       <button class="nav-btn" data-action="nav" data-view="orgs">🏢 公司与账户</button>
       <button class="nav-btn" data-action="nav" data-view="settings">⚙️ 设置</button>
@@ -91,7 +92,7 @@
   </div>
 </aside>
 
-<script src="app.js?v=2.13.0"></script>
+<script src="app.js?v=2.14.0"></script>
 <script>
 /* 深链接：#agent 直接打开助手（方便收藏 / 排查问题） */
 if(/[#&]agent/.test(location.hash)){
