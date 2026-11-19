@@ -2822,7 +2822,8 @@ def port_open():
 # 放在注册蓝图那儿会因为函数还没定义而失败。
 try:
     from agent_extra import bind_app as _bind_export
-    _bind_export(app, {'excel': export_excel, 'cash_counts': export_cash_counts})
+    _bind_export(app, {'excel': export_excel, 'cash_counts': export_cash_counts,
+                       'del_attachment': del_attachment})
 except Exception as _e:
     print('[agent] 导出工具绑定失败:', _e)
 

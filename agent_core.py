@@ -383,15 +383,57 @@ def perm_block():
         return ''
 
 
+def skill_block():
+    """已有技能只报 id / 名称 / 触发场景，步骤留在文件里，不占上下文。"""
+    try:
+        from agent_skill import block
+        return block()
+    except Exception:
+        return ''
+
+
 def build_system(sid, company, att_block=''):
     try:
         tmpl = load_system_template()
     except Exception:
         tmpl = ''
-    extra = (att_block or '') + perm_block() + facts_block(sid) + pending_block(sid)
+    extra = ((att_block or '') + perm_block() + facts_block(sid)
+             + pending_block(sid) + skill_block())
     out = tmpl.replace('{today}', date.today().isoformat())
     out = out.replace('{company}', company or '（未设置）')
     out = out.replace('{extra}', extra)
+    return out
+
+
+def compact_history(hist, keep=12, max_summary=8):
+    """把超出窗口的老对话压成几行要点，而不是直接砍掉。
+
+    原来只有 ``history[-12:]``：第 13 轮之前说的话全部蒸发，用户说「就按昨天
+    那个口径」时模型一脸茫然。这里保留最近 keep 条原文，更早的每轮各压一行，
+    脉络还在，token 不炸。
+    """
+    hs = [h for h in (hist or [])
+          if h.get('role') in ('user', 'assistant') and h.get('content')]
+    if len(hs) <= keep:
+        return [{'role': h['role'], 'content': str(h['content'])[:4000]}
+                for h in hs]
+    head, tail = hs[:-keep], hs[-keep:]
+    picked = head[-max_summary:]
+    lines = []
+    if len(head) > max_summary:
+        lines.append(f'（更早还有 {len(head) - max_summary} 轮，已省略）')
+    for h in picked:
+        txt = re.sub(r'\s+', ' ', str(h['content'])).strip()
+        txt = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', txt)      # 去掉图片占位
+        if h['role'] == 'user':
+            lines.append('· 用户：' + txt[:70])
+        else:
+            lines.append('· 你答：' + txt[:90])
+    out = [{'role': 'assistant',
+            'content': '【前面聊过的要点】\n' + '\n'.join(lines) +
+                       '\n（以上是摘要，具体数字一律以重新查询为准）'}]
+    out += [{'role': h['role'], 'content': str(h['content'])[:4000]}
+            for h in tail]
     return out
 
 
@@ -622,11 +664,8 @@ def run_agent_stream(cfg, sid, history, text, atts=None, company_id=None):
         # 历史 + 本轮输入
         messages = [{'role': 'system',
                      'content': build_system(sid, _company_block(company_id))}]
-        for h in (history or [])[-12:]:
-            role = h.get('role')
-            if role in ('user', 'assistant') and h.get('content'):
-                messages.append({'role': role,
-                                 'content': str(h['content'])[:4000]})
+        for h in compact_history(history):
+            messages.append({'role': h['role'], 'content': h['content']})
         messages.append({'role': 'user',
                          'content': build_user_content(text, atts, cfg)})
 

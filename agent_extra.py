@@ -263,6 +263,82 @@ def t_list_reminders(args):
     return res, links
 
 
+def t_delete_attachment(args):
+    aid = _opt_int(args.get('att_id'))
+    if not aid:
+        return {'error': '要给 att_id。不确定就先 list_attachments 查'}, []
+    rr = _fetch('SELECT at.*, e.date, e.description FROM attachments at '
+                'JOIN entries e ON e.id = at.entry_id WHERE at.id = ?', (aid,))
+    if not rr:
+        return {'error': f'没有 id={aid} 的附件'}, []
+    a = rr[0]
+    who = f"{a['date']} {a['description'] or '流水'}"
+    if not args.get('confirm'):
+        return {'need_confirm': True, 'att_id': aid,
+                'impact': f"将永久删除附件「{a['orig_name']}」（挂在 {who} 上），"
+                          f"文件删掉后无法恢复，流水本身不受影响",
+                'hint': '把 impact 原样告给用户，他说确认后再带 confirm=true 重调'}, []
+    if _APP is None or 'del_attachment' not in _VIEWS:
+        return {'error': '删除模块未就绪'}, []
+    try:
+        with _APP.test_request_context('/api/attachments/%d' % aid, method='DELETE'):
+            resp = _VIEWS['del_attachment'](aid)
+        if resp.status_code >= 400:
+            j = resp.get_json(silent=True) or {}
+            return {'error': j.get('error') or f'删除失败（HTTP {resp.status_code}）'}, []
+    except Exception as e:                       # noqa: BLE001
+        return {'error': f'删除时出错：{type(e).__name__}: {e}'}, []
+    return {'ok': True, 'att_id': aid, 'fname': a['orig_name'],
+            'message': f"已删除附件「{a['orig_name']}」"}, []
+
+
+def t_list_attachments(args):
+    aid = _opt_int(args.get('att_id'))
+    eid = _opt_int(args.get('entry_id'))
+    cid = _opt_int(args.get('company_id'))
+    where, p = [], []
+    if aid:
+        where.append('at.id = ?')
+        p.append(aid)
+    if eid:
+        where.append('at.entry_id = ?')
+        p.append(eid)
+    if cid:
+        where.append('a.company_id = ?')
+        p.append(cid)
+    if not where:
+        return {'error': '给 entry_id（某笔流水的附件）、company_id 或 att_id'}, []
+    try:
+        limit = max(1, min(int(args.get('limit') or 30), 200))
+    except (TypeError, ValueError):
+        limit = 30
+    sql = ('SELECT at.id, at.entry_id, at.orig_name, at.size, at.mime, at.uploaded_at, '
+           'e.date, e.description, e.account_id, a.name AS account_name, '
+           'c.name AS company_name '
+           'FROM attachments at JOIN entries e ON e.id = at.entry_id '
+           'JOIN accounts a ON a.id = e.account_id '
+           'JOIN companies c ON c.id = a.company_id '
+           'WHERE ' + ' AND '.join(where) + ' ORDER BY at.id DESC LIMIT ?')
+    p.append(limit)
+    rr = _fetch(sql, p)
+    out, links = [], []
+    for r in rr:
+        out.append({'att_id': r['id'], 'entry_id': r['entry_id'],
+                    'fname': r['orig_name'],
+                    'size_kb': round((r['size'] or 0) / 1024, 1),
+                    'mime': r['mime'], 'uploaded_at': r['uploaded_at'],
+                    'date': r['date'], 'description': r['description'],
+                    'account': r['account_name'], 'company': r['company_name'],
+                    'link': f"attachment:{r['id']}"})
+        if len(links) < 5:
+            links.append({'label': f"{r['orig_name']} · {r['date']}",
+                          'target': f"attachment:{r['id']}"})
+    res = {'ok': True, 'count': len(out), 'items': out}
+    if not out:
+        res['message'] = '这个范围内没有附件'
+    return res, links
+
+
 TOOLS = [
     {'type': 'function', 'function': {
         'name': 'export_data',
@@ -301,7 +377,32 @@ TOOLS = [
             'keyword': {'type': 'string', 'description': '摘要/备注/对方/票号关键词'},
             'limit': {'type': 'integer', 'description': '默认 40，最大 200'}},
             'required': []}}},
+    {'type': 'function', 'function': {
+        'name': 'list_attachments',
+        'description': '查附件：某笔流水挂了哪些文件、某家公司总共有哪些。'
+                       '用户问「这笔的发票呢」「附件还在不在」时用；'
+                       '删之前也要先用它确认 att_id。',
+        'parameters': {'type': 'object', 'properties': {
+            'entry_id': {'type': 'integer', 'description': '只查这一笔流水'},
+            'company_id': {'type': 'integer', 'description': '只查这家公司'},
+            'att_id': {'type': 'integer', 'description': '只查某个附件'},
+            'limit': {'type': 'integer', 'description': '默认 30，最大 200'}},
+            'required': []}}},
+    {'type': 'function', 'function': {
+        'name': 'delete_attachment',
+        'description': '删除一个附件（文件和记录一起删，不可恢复，流水本身不受影响）。'
+                       '两段式：第一次不带 confirm 会返回 impact，'
+                       '把影响告给用户、他明确同意后再带 confirm=true 重调。'
+                       '**不要**自己判断「重复了」就直接删。',
+        'parameters': {'type': 'object', 'properties': {
+            'att_id': {'type': 'integer', 'description': '要删的附件 id'},
+            'confirm': {'type': 'boolean',
+                        'description': '用户已明确同意时才传 true'}},
+            'required': ['att_id']}}},
 ]
 
-IMPL = {'export_data': t_export_data, 'list_reminders': t_list_reminders}
-LABELS = {'export_data': '导出 Excel', 'list_reminders': '读取待跟进清单'}
+IMPL = {'export_data': t_export_data, 'list_reminders': t_list_reminders,
+        'list_attachments': t_list_attachments,
+        'delete_attachment': t_delete_attachment}
+LABELS = {'export_data': '导出 Excel', 'list_reminders': '读取待跟进清单',
+          'list_attachments': '查看附件', 'delete_attachment': '删除附件'}
