@@ -2754,6 +2754,16 @@ def export_excel():
     return send_file(tmp.name, as_attachment=True, download_name=fname)
 
 
+@app.get('/api/export/agent/<path:name>')
+def export_agent_file(name):
+    """AI 生成的导出文件下载口。只开放 data/exports 下的文件。"""
+    d = os.path.join(DATA_DIR, 'exports')
+    os.makedirs(d, exist_ok=True)
+    # 文件名带时间戳前缀防覆盖，下载时还原成干净名字
+    dl = re.sub(r'^\d{8}_\d{6}_', '', name)
+    return send_from_directory(d, name, as_attachment=True, download_name=dl)
+
+
 @app.get('/api/backup')
 def backup():
     buf = io.BytesIO()
@@ -2806,6 +2816,15 @@ def port_open():
         return False
     except OSError:
         return True
+
+
+# 导出工具要在这里绑定：export_excel / export_cash_counts 都在上面定义完了，
+# 放在注册蓝图那儿会因为函数还没定义而失败。
+try:
+    from agent_extra import bind_app as _bind_export
+    _bind_export(app, {'excel': export_excel, 'cash_counts': export_cash_counts})
+except Exception as _e:
+    print('[agent] 导出工具绑定失败:', _e)
 
 
 if __name__ == '__main__':

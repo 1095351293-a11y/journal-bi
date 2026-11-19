@@ -2550,6 +2550,9 @@ function mdInline(t){
              '<span class="ag-il" data-action="agent-link" data-target="$2" ' +
              'title="点击打开">$1</span>')
     .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
+             '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    // AI 生成的导出文件：/api/export/agent/xxx.xlsx，直接点就下载
+    .replace(/\[([^\]]+)\]\((\/api\/[^)\s]+)\)/g,
              '<a href="$2" target="_blank" rel="noopener">$1</a>');
 }
 /* 表格里的纯金额/百分比单元格右对齐 */
@@ -2889,6 +2892,23 @@ function agPropItemsHTML(p, mi, pi){
     return parts.length ? `<div class="ag-dt-box">${parts.join('')}</div>` : '';
   };
   if(p.kind === 'update'){
+    // 批量修改：一套值套到多笔，按行列出；单笔微调请去日记账（这里不做行内编辑）
+    if(items.length > 1){
+      const cut2 = s => { const v = '' + (s || ''); return ex ? v : v.slice(0, 36); };
+      return `<div class="ag-bulk">
+        <div class="ag-bulk-tip">批量修改 ${items.length} 笔，每笔改成同一套值；要单独调整某一笔请到日记账里改。</div>
+        <table class="ag-bulk-tbl"><thead><tr>
+          <th>日期</th><th>账户</th><th>摘要</th><th>改动</th>
+        </tr></thead><tbody>
+        ${items.map(it => `<tr>
+          <td class="nowrap">${esc(it.date || '')}</td>
+          <td class="nowrap">${esc(it.account_name || '')}</td>
+          <td>${esc(cut2(it.summary || it.description || ''))}</td>
+          <td class="ag-bulk-chg">${(it.changes || []).map(c =>
+            `<span class="ag-chg-i">${esc(c.label)}：<s>${esc(cut2(c.from) || '空')}</s> → <b>${esc(cut2(c.to) || '空')}</b></span>`).join('')}</td>
+        </tr>`).join('')}
+        </tbody></table></div>`;
+    }
     const it = items[0] || {};
     // 老卡片没有整行字段：从 changes 里补一份，保证「改字段」能编辑
     if(it.description === undefined){
@@ -3013,7 +3033,8 @@ function agProposalHTML(p, mi, pi){
     <div class="ag-prop-f">
       <button class="btn sm primary" data-action="prop-confirm" data-mi="${mi}" data-pi="${pi}"
         ${p.danger && !p.ack ? 'disabled' : ''}>${okTxt}</button>
-      ${p.kind === 'create' || p.kind === 'import' || p.kind === 'update'
+      ${(p.kind === 'create' || p.kind === 'import' || p.kind === 'update')
+        && !(p.kind === 'update' && (p.items || []).length > 1)
         ? `<button class="btn sm" data-action="prop-edit" data-mi="${mi}" data-pi="${pi}">${p.editing?'完成修改':'改字段'}</button>` : ''}
       <button class="btn sm" data-action="prop-cancel" data-mi="${mi}" data-pi="${pi}">取消</button>
       <span class="muted small">确认前不会改动账本</span>

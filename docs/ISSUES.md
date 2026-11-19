@@ -5,6 +5,33 @@
 
 ---
 
+## 2026-11-19
+
+### 2. 合并流水后，会话里缓存的余额/流水不失效
+
+- **现象**：让 AI 合并两笔之后紧接着问余额，它仍然引用合并前的数字；而且**纯查询**的对话轮次也会把「合并」这个写工具挂上来。
+- **原因**：`propose_merge_entries` 是写操作，却漏在 `agent.py` 的 `WRITE_NAMES` 集合外。连带的三个后果：
+  1. `pick_tools(allow_write=False)` 剔不掉它，只读轮次也暴露；
+  2. `agent_core.py:736` 的 `if name in WRITE_NAMES` 判断不成立，auto 直写后不调 `sess_mark_dirty`，会话事实缓存全部保持「干净」状态；
+  3. 工具摘要走错分支，合并结果只能显示成通用文本。
+- **解决**：`WRITE_NAMES` 补上 `propose_merge_entries`，并在集合上方注明为什么它必须归位。
+- **涉及**：`agent.py`
+- **提交**：本次
+
+### 1. 「导出 Excel」「有哪些还没跟进」这两类页面操作，AI 做不了
+
+- **现象**：页面上有导出按钮和提醒弹窗，但让 AI「导出一份 Excel」「看看哪些还没签收」，它只能回「请到页面点导出」。
+- **原因**：盘了一遍 `app.py` 的 39 个 `/api` 接口，有 28 个已经包成工具，缺的 5 个里有三个是**有独立产出物或独立语义**的：`/api/export/excel`、`/api/export/cash-counts`、`/api/notes/reminders`。其余两个（附件上传/删除）属于用户拖文件的行为，不需要 AI 代劳。
+- **解决**：新增 `agent_extra.py`
+  - `export_data(kind=journal|deposits|cash_counts|master, ...)`：**不重写导出逻辑**，在同一进程里用 `app.test_request_context` 调原来的视图函数取 Response 字节——`export_excel` 上千行，动它有把真实导出搞坏的风险。生成的文件落 `data/exports/`（保留 7 天自动清），返回可点的 `url:/api/export/agent/...` 链接；新增该下载路由，只开放 `data/exports` 目录。
+  - `list_reminders(...)`：对应「备注非空 **或** 挂了标签」，比 `list_tags` 全——只有备注、没挂标签的那批以前完全查不到。返回 `breakdown` 区分「只有备注」「只有标签」。
+  - 视图返回 JSON（`bad(...)`）时识别为错误，不会把 JSON 存成 xlsx；`send_file` 的 `direct_passthrough` 要先关掉才能取字节。
+  - 前端 `mdInline` 增加 `/api/...` 相对链接规则，AI 在正文里写的下载链接可直接点。
+- **涉及**：`agent_extra.py`（新）、`agent.py`、`app.py`、`prompts/agent_system.md`、`static/app.js`、`static/index.html`（v2.10.2）
+- **提交**：本次
+
+---
+
 ## 2026-11-18
 
 ### 4. 只改标签时，加一个标签会把原来的标签全清掉；卡片上也看不到原标签

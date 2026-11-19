@@ -827,8 +827,21 @@ try:
 except Exception as _e:
     print('[agent] 管理工具未加载:', _e)
 
-WRITE_NAMES = {'propose_entry', 'propose_update_entry',
-               'propose_delete_entries', 'import_file', 'propose_import',
+# 页面能点、AI 原来够不着的出口：Excel 导出 + 待跟进清单
+try:
+    from agent_extra import IMPL as EXTRA_IMPL, LABELS as EXTRA_LABELS, TOOLS as EXTRA_TOOLS
+    TOOLS.extend(EXTRA_TOOLS)
+    TOOL_IMPL.update(EXTRA_IMPL)
+    TOOL_LABEL.update(EXTRA_LABELS)
+except Exception as _e:
+    print('[agent] 导出/待跟进工具未加载:', _e)
+
+# 这些工具会改账本或系统结构：查询轮次不给它们，写成功才标脏
+# propose_merge_entries 之前漏在这里，导致合并后不触发 sess_mark_dirty、
+# 纯查询轮次也会把它挂上来。合并是写操作，必须归位。
+WRITE_NAMES = {'propose_entry', 'propose_update_entry', 'propose_update_entries',
+               'propose_delete_entries', 'propose_merge_entries',
+               'import_file', 'propose_import',
                'undo_write', 'manage_company', 'manage_account', 'manage_tag',
                'manage_deposit', 'set_exchange_rates', 'manage_cash_count',
                'backup_now'}
