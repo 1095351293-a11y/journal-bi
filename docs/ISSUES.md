@@ -7,6 +7,22 @@
 
 ## 2026-11-19
 
+### 7. Agent 面板挡页面、点链接就把对话关了、看不到技能、没有 MCP
+
+- **现象**：四个问题——① 打开助手后右侧像被盖住，主页面表格挤成一条；② 点回答里的流水链接，助手整个收起，回来还得重新找会话；③ 不知道 AI 到底存了哪些技能；④ 只能用它内置的 36 个工具，接不了外部 MCP。
+- **原因**：
+  1. 抽屉是 `position:fixed` 靠 `#main{margin-right}` 让位，但打开后没有触发 `resize`，图表按旧宽度画、表格列被压；窄屏更直接 `width:100vw` 全覆盖。
+  2. `agentOpenLink()` 第一行就是 `agentClose()`，作者当时以为要"先收起抽屉让页面露出来"。
+  3. 技能只存在 `data/skills/*.json` 里，除系统提示词注入给模型外，界面上没有任何入口。
+  4. 完全没有 MCP 客户端。
+- **解决**：
+  - **让位布局**：默认宽度 400px；打开/关闭后 `agentRelayout()` 延时触发一次 `resize`，图表与表格按新宽度重排；`<900px` 改成半宽抽屉（`min(94vw,560px)`）+ 半透明遮罩，点遮罩才关，不再整屏糊住。统一改名「Agent」。
+  - **链接弹窗**：`agentOpenLink` 去掉 `agentClose()`。`entry:` / `journal:` 改为 `agentPeekEntry` / `agentPeekAccount` 只读弹窗（新增 `/api/agent/peek/entry/<id>`、`/api/agent/peek/account/<id>`），带「在日记账中打开」；`dashboard` / `deposits` / `cash` 只切主区域页面，Agent 保持打开；附件与外部链接走新标签页。
+  - **能力面板**：助手头部加 🧩，弹窗分「技能 / MCP」两个 tab。技能列出名称、触发场景、步骤链，支持「用一下」（把指令填进输入框）和删除；新增 `GET /api/agent/skills`、`POST /api/agent/skills/<id>/delete`。
+  - **MCP 客户端**（新文件 `agent_mcp.py`）：stdio 子进程 + JSON-RPC 2.0 逐行，`initialize → notifications/initialized → tools/list → tools/call`，支持分页 `nextCursor`；工具命名 `mcp__<server>__<tool>`，在 `pick_tools` 里并入工具面（只读模式不下发），`run_tool` 按前缀分流，`build_system` 注入已连接工具清单。懒连接 + 失败 60 秒冷却 + 启动后台预热，任一服务器起不来不影响对话。配置存 `data/mcp.json`，接口 `GET/POST/DELETE /api/agent/mcp` 与 `POST /api/agent/mcp/<name>/connect`。
+- **涉及**：`agent_mcp.py`（新）、`agent_core.py`、`app.py`、`static/index.html`、`static/app.js`、`static/style.css`、`docs/ISSUES.md`
+- **提交**：本次
+
 ### 6. AI 有些操作没经过我审核就直接改了
 
 - **现象**：让 AI 删公司、删账户、改期初余额，它说一句「已删除」就真删了，用户全程没看到确认；记账、改账、建账户更是一直直接落库，没有任何提示。

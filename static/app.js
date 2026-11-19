@@ -2653,36 +2653,117 @@ function agentLinksHTML(m){
         <div class="ag-more-box">${rest.map(agentLinkHTML).join('')}</div></details>` : ''}
     </div>`;
 }
+/* Agent 回答里的链接：一律在弹窗里预览，不关 Agent 面板、不动你正在看的页面 */
 async function agentOpenLink(target){
-  agentClose();   // 先收起抽屉，让主区域的页面/弹窗露出来
   const parts = String(target || '').split(':');
   const type = parts[0];
-  if(type === 'url'){ window.open(String(target).slice(4), '_blank', 'noopener'); return; }
-  if(type === 'attachment'){ window.open('/api/attachments/' + parts[1] + '/file'); return; }
-  if(type === 'journal' || type === 'entry'){
-    const accId = type === 'entry' ? +parts[2] : +parts[1];
-    const a = accById(accId);
-    if(!a){ alert('找不到该账户，可能已被删除'); return; }
-    if(a.company_id !== S.company){
-      S.company = a.company_id; await refreshBootstrap();
-      $('#companySelect').value = S.company;
-    }
-    S.jr = { accId, account:null, entries:[], loaded:false,
-             from:'', to:'', preset:'all', q:'', status:'', tagId:'' };
-    switchView('journal');
-    if(type === 'entry'){
-      await renderJournal();
-      openEntryModal(+parts[1]);
-    }
+  if(type === 'url'){
+    window.open(String(target).slice(4), '_blank', 'noopener');
     return;
+  }
+  if(type === 'attachment'){
+    window.open('/api/attachments/' + parts[1] + '/file', '_blank', 'noopener');
+    return;
+  }
+  if(type === 'entry'){
+    const eid = +parts[1];
+    if(eid) return agentPeekEntry(eid);
+  }
+  if(type === 'journal' || type === 'account'){
+    const aid = +parts[1];
+    if(aid) return agentPeekAccount(aid);
   }
   if(type === 'dashboard' || type === 'deposits' || type === 'cash'){
     const cid = +parts[1];
-    if(cid && cid !== S.company){ S.company = cid; await refreshBootstrap(); $('#companySelect').value = cid; }
+    if(cid && cid !== S.company){
+      S.company = cid;
+      await refreshBootstrap();
+      const sel = $('#companySelect'); if(sel) sel.value = cid;
+    }
     switchView(type);
-    return;
+    return;                     // 只换主区域页面，Agent 保持打开
   }
   alert('无法识别的链接：' + target);
+}
+
+/* 流水预览弹窗（只读，改数据请去日记账） */
+async function agentPeekEntry(eid){
+  let d;
+  try{ d = await api('/api/agent/peek/entry/' + eid); }
+  catch(err){
+    openModal(modalHead('流水预览') + `<div class="hint">${esc(err.message)}</div>
+      <div class="modal-actions"><button class="btn" data-action="modal-close">关闭</button></div>`);
+    return;
+  }
+  const e = d.entry || {};
+  const isIn = (e.debit || 0) > 0;
+  const amt = e.debit || e.credit || 0;
+  const tags = (e.tags || []).map(t => `<span class="peek-tag">${esc(t)}</span>`).join('');
+  const atts = (e.attachments || []).map(a =>
+    `<a class="peek-att" href="/api/attachments/${a.id}/file" target="_blank"
+       rel="noopener">📎 ${esc(a.orig_name || '附件')}</a>`).join('');
+  openModal(modalHead(`流水 #${e.id}`) + `
+    <div class="peek">
+      <div class="peek-top">
+        <div class="peek-amt ${isIn ? 'in' : 'out'}">${isIn ? '+' : '−'} ${fmt(amt)}
+          <span class="peek-cur">${esc(e.currency || '')}</span></div>
+        <div class="peek-date">${esc(e.date || '')}</div>
+      </div>
+      <div class="peek-desc">${esc(e.description || '')}</div>
+      <div class="peek-kv">
+        <span><i>公司</i>${esc(e.company_name || '')}</span>
+        <span><i>账户</i>${esc(e.account_name || '')}</span>
+        ${e.party ? `<span><i>对方</i>${esc(e.party)}</span>` : ''}
+        ${e.project ? `<span><i>项目</i>${esc(e.project)}</span>` : ''}
+        ${e.check_no ? `<span><i>单据号</i>${esc(e.check_no)}</span>` : ''}
+        ${e.pending ? `<span><i>状态</i>未兑现 / 未到账</span>` : ''}
+      </div>
+      ${e.note ? `<div class="peek-note"><i>备注</i>${esc(e.note)}</div>` : ''}
+      ${tags ? `<div class="peek-tags">${tags}</div>` : ''}
+      ${atts ? `<div class="peek-atts">${atts}</div>` : ''}
+    </div>
+    <div class="modal-actions">
+      <button class="btn" data-action="peek-journal" data-acc="${e.account_id}">在日记账中打开</button>
+      <button class="btn primary" data-action="modal-close">关闭</button>
+    </div>`);
+}
+
+/* 账户预览弹窗：最近 60 笔 + 合计 */
+async function agentPeekAccount(aid){
+  let d;
+  try{ d = await api('/api/agent/peek/account/' + aid); }
+  catch(err){
+    openModal(modalHead('账户预览') + `<div class="hint">${esc(err.message)}</div>
+      <div class="modal-actions"><button class="btn" data-action="modal-close">关闭</button></div>`);
+    return;
+  }
+  const a = d.account || {}, es = d.entries || [], sm = d.summary || {};
+  const rows = es.map(x => `<tr>
+      <td class="nowrap">${esc(x.date || '')}</td>
+      <td>${esc(x.description || '')}</td>
+      <td>${esc(x.party || '')}</td>
+      <td class="num in">${x.debit ? fmt(x.debit) : ''}</td>
+      <td class="num out">${x.credit ? fmt(x.credit) : ''}</td>
+    </tr>`).join('');
+  openModal(modalHead(`账户 · ${esc(a.name || '')}`) + `
+    <div class="peek-kv">
+      <span><i>公司</i>${esc(a.company_name || '')}</span>
+      <span><i>币种</i>${esc(a.currency || '')}</span>
+      <span><i>期初</i>${fmt(a.opening)}</span>
+      <span><i>共</i>${fmtI(sm.count)} 笔</span>
+      <span><i>收入合计</i>${fmt(sm.debit)}</span>
+      <span><i>支出合计</i>${fmt(sm.credit)}</span>
+    </div>
+    <div class="peek-tbl-wrap"><table class="peek-tbl">
+      <thead><tr><th>日期</th><th>摘要</th><th>对方</th>
+        <th class="num">收入</th><th class="num">支出</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="5" class="muted">这个账户还没有流水</td></tr>'}</tbody>
+    </table></div>
+    <div class="hint" style="margin-top:8px">只列最近 ${es.length} 笔，完整流水点「在日记账中打开」。</div>
+    <div class="modal-actions">
+      <button class="btn" data-action="peek-journal" data-acc="${a.id}">在日记账中打开</button>
+      <button class="btn primary" data-action="modal-close">关闭</button>
+    </div>`);
 }
 
 /* ---- 模型配置 ---- */
@@ -2696,7 +2777,7 @@ function agentCfgCardHTML(cfg){
   const ps = S.agent.presets;
   const cur = ps.find(p => p.id === cfg.provider) || ps[ps.length-1] || {};
   return `
-  <b>🤖 AI 模型（查账助手）</b>
+  <b>🤖 Agent 模型</b>
   <div class="hint" style="margin:4px 0 12px;line-height:1.8">
     支持任何 <b>OpenAI 兼容</b>接口（DeepSeek / OpenAI / 通义 / 智谱 / Kimi / 硅基流动 / Ollama / 自建网关）。
     选一个预设会自动填好地址和模型名，也可手动改。配置只存在本机 <code>data/agent_config.json</code>。
@@ -3095,7 +3176,7 @@ function agentPaint(){
   if(!S.agent.msgs.length){
     box.innerHTML = `<div class="ag-empty">
       <div class="ag-empty-ico">🤖</div>
-      <div class="ag-empty-t">查账助手</div>
+      <div class="ag-empty-t">Agent</div>
       <div class="muted small" style="max-width:520px;line-height:1.9">
         直接用大白话问，我会自己去查库：余额、收支、某笔流水、大额支出、未兑现支票、定期到期…
         查到的记录会变成下方可点击的链接，点一下就能弹出对应的流水或账户。
@@ -3577,7 +3658,7 @@ const AGENT_W_KEY = 'journal_agent_width';
 const agentIsNarrow = () => window.innerWidth <= 900;
 function agentWidth(){
   const w = +(localStorage.getItem(AGENT_W_KEY) || 0);
-  return (w >= 340 && w <= 900) ? w : 430;
+  return (w >= 320 && w <= 900) ? w : 400;
 }
 function agentApplyWidth(w){
   document.documentElement.style.setProperty('--agent-w', Math.round(w) + 'px');
@@ -3594,11 +3675,17 @@ function agentOpen(){
   agentPaint();
   agentPaintSessions();
   setTimeout(()=>{ if(!agentIsNarrow()) $('#agentInput')?.focus(); }, 240);
+  agentRelayout();
+}
+/* 抽屉宽度变化后让主区域重算：图表按新宽度重画，表格列不再被挤住 */
+function agentRelayout(){
+  setTimeout(()=>{ try{ window.dispatchEvent(new Event('resize')); }catch(e){} }, 260);
 }
 function agentClose(){
   const dock = $('#agentDock');
   if(!dock) return;
   dock.classList.remove('open');
+  agentRelayout();
   dock.setAttribute('aria-hidden', 'true');
   document.body.classList.remove('agent-open');
   $('#navAgent')?.classList.remove('active');
@@ -3608,6 +3695,149 @@ function agentToggle(){
   const dock = $('#agentDock');
   if(dock && dock.classList.contains('open')) agentClose(); else agentOpen();
 }
+
+/* ---------------------------------------------------------------- 能力面板
+   🧩 按钮：看已有技能（AI 存下来的流程）+ 管理 MCP 服务器。 */
+let AG_CAP = {tab: 'skills', skills: [], mcp: null, loading: false};
+
+async function agentCapOpen(tab){
+  AG_CAP.tab = tab || 'skills';
+  openModal(modalHead('🧩 技能与 MCP') + '<div id="capBody" class="cap-empty">加载中…</div>');
+  await agentCapRefresh();
+}
+
+async function agentCapRefresh(){
+  const body = $('#capBody');
+  if(!body) return;
+  try{
+    const [sk, mc] = await Promise.all([
+      api('/api/agent/skills').catch(() => ({items: []})),
+      api('/api/agent/mcp').catch(() => ({servers: []})),
+    ]);
+    AG_CAP.skills = sk.items || [];
+    AG_CAP.mcp = mc;
+  }catch(e){}
+  const tab = AG_CAP.tab;
+  const ns = AG_CAP.skills.length;
+  const nm = (AG_CAP.mcp && AG_CAP.mcp.servers || []).length;
+  let html = `<div class="cap-tabs">
+    <button class="cap-tab ${tab==='skills'?'on':''}" data-action="cap-tab" data-tab="skills">技能${ns?` · ${ns}`:''}</button>
+    <button class="cap-tab ${tab==='mcp'?'on':''}" data-action="cap-tab" data-tab="mcp">MCP${nm?` · ${nm}`:''}</button>
+  </div>`;
+  html += tab === 'skills' ? capSkillsHTML() : capMcpHTML();
+  body.className = '';
+  body.innerHTML = html;
+}
+
+function capSkillsHTML(){
+  const items = AG_CAP.skills || [];
+  if(!items.length){
+    return `<div class="cap-empty">还没有技能。<br>
+      在对话里说「以后月末都这样做：先查未兑现、再列待跟进」，<br>
+      AI 会把这几步存成技能，存好后出现在这里。</div>`;
+  }
+  return items.map(s => `<div class="cap-item">
+    <div class="cap-h">
+      <div>
+        <div class="cap-name">${esc(s.name || s.id)}</div>
+        <div class="cap-when">${esc(s.when || s.desc || '（没写触发场景）')}</div>
+      </div>
+      <div class="row" style="gap:6px;flex-wrap:nowrap">
+        <button class="btn sm" data-action="cap-skill-use" data-id="${esc(s.id)}">用一下</button>
+        <button class="btn sm danger" data-action="cap-skill-del" data-id="${esc(s.id)}">删除</button>
+      </div>
+    </div>
+    <div class="cap-steps">${(s.steps || []).map((st, i) =>
+      `<span class="cap-step">${i + 1}. ${esc(st.label || st.tool)}</span>`).join('')}</div>
+  </div>`).join('') + `<div class="hint" style="margin-top:6px">
+    技能只能按顺序调用已有工具，不能写代码、不能算数、不能直接改数据库。</div>`;
+}
+
+function capMcpHTML(){
+  const d = AG_CAP.mcp || {servers: []};
+  const list = (d.servers || []).map(s => {
+    const ok = s.connected;
+    const st = ok ? `<span class="cap-ok">已连接 · ${s.tools.length} 个工具</span>`
+      : (s.error ? `<span class="cap-err">未连接：${esc(s.error)}</span>`
+        : '<span class="muted small">未连接</span>');
+    const tools = ok && s.tools.length
+      ? `<div class="cap-steps">${s.tools.map(t =>
+          `<span class="cap-step" title="${esc(t.desc || '')}">${esc(t.name)}</span>`).join('')}</div>`
+      : '';
+    return `<div class="cap-item">
+      <div class="cap-h">
+        <div>
+          <div class="cap-name">${esc(s.name)} ${s.enabled ? '' : '<span class="muted small">（已停用）</span>'}</div>
+          <div class="cap-when">${esc(s.command)} ${esc((s.args || []).join(' '))}</div>
+        </div>
+        <div class="row" style="gap:6px;flex-wrap:nowrap">
+          <button class="btn sm" data-action="cap-mcp-connect" data-id="${esc(s.name)}">${ok ? '重连' : '连接'}</button>
+          <button class="btn sm danger" data-action="cap-mcp-del" data-id="${esc(s.name)}">删除</button>
+        </div>
+      </div>
+      <div style="margin-top:6px">${st}</div>
+      ${tools}
+    </div>`;
+  }).join('');
+
+  return (list || `<div class="cap-empty">还没配置 MCP 服务器。<br>
+      在下面填一个命令就行，例如 <code>npx -y @modelcontextprotocol/server-filesystem C:\\data</code>。</div>`)
+    + `<div class="hint" style="margin-top:10px;line-height:1.8">
+      MCP 工具会直接作用在外部系统上，本系统无法撤销，也不受「撤销这次」保护。<br>
+      只读模式下不会下发给 AI。</div>
+    <div class="cap-form">
+      <label>名称</label><input class="inp" id="mcpName" placeholder="filesystem">
+      <label>命令</label><input class="inp" id="mcpCmd" placeholder="npx">
+      <label>参数</label><input class="inp" id="mcpArgs" placeholder="-y @modelcontextprotocol/server-filesystem C:\\data">
+      <label>环境变量</label><input class="inp" id="mcpEnv" placeholder="KEY=VALUE，多个用 ; 分隔">
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" data-action="cap-mcp-save">添加并连接</button>
+      <button class="btn" data-action="modal-close">关闭</button>
+    </div>`;
+}
+
+function capSplitArgs(s){
+  const out = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m;
+  while((m = re.exec(String(s || '')))){
+    out.push(m[1] ?? m[2] ?? m[3]);
+  }
+  return out;
+}
+
+function btnBusy(el, text){
+  if(!el) return;
+  el.disabled = true;
+  if(text) el.textContent = text;
+}
+
+async function agentCapMcpSave(){
+  const g = id => ($(id) || {}).value || '';
+  const name = g('#mcpName').trim();
+  const cmd = g('#mcpCmd').trim();
+  if(!name || !cmd){ alert('名称和命令都要填'); return; }
+  const args = capSplitArgs(g('#mcpArgs'));
+  const env = {};
+  g('#mcpEnv').split(/[;\n]/).forEach(line => {
+    const i = line.indexOf('=');
+    if(i > 0) env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  });
+  const btn = $('[data-action="cap-mcp-save"]');
+  if(btn){ btn.disabled = true; btn.textContent = '连接中…'; }
+  let d;
+  try{
+    d = await jpost('/api/agent/mcp', {name, command: cmd, args, env, enabled: true});
+  }catch(e){
+    d = {ok: false, error: e.message};
+  }
+  if(!d.ok){
+    alert('保存了，但连接失败：\n' + (d.error || '未知错误'));
+  }
+  await agentCapRefresh();
+}
+
 
 /* ---------------------------------------------------------------- 访问模式
    四档：只读 / 逐条确认 / 自动写入 / 完全访问。
@@ -3791,6 +4021,22 @@ document.addEventListener('click', async e=>{
       case 'mx-go': doMasterExport(); break;
       case 'goto': switchView(el.dataset.view); break;
       case 'modal-close': closeModal(); break;
+      case 'peek-journal': {
+        // 从预览弹窗跳到日记账：关弹窗、切页面，Agent 不关
+        const aid = +el.dataset.acc;
+        closeModal();
+        const a = accById(aid);
+        if(!a){ alert('找不到该账户，可能已被删除'); break; }
+        if(a.company_id !== S.company){
+          S.company = a.company_id;
+          await refreshBootstrap();
+          const sc = $('#companySelect'); if(sc) sc.value = S.company;
+        }
+        S.jr = { accId: aid, account:null, entries:[], loaded:false,
+                 from:'', to:'', preset:'all', q:'', status:'', tagId:'' };
+        switchView('journal');
+        break;
+      }
       case 'agent-toggle': agentToggle(); break;
       case 'agent-close': agentClose(); break;
       case 'agent-send': await agentSend(); break;
@@ -3820,6 +4066,43 @@ document.addEventListener('click', async e=>{
         agentSaveMsgs(); agentPaintAtts(); agentPaint(); break;
       }
       case 'agent-settings': agentClose(); switchView('settings'); break;
+      case 'agent-capabilities': agentCapOpen('skills'); break;
+      case 'cap-tab':
+        AG_CAP.tab = el.dataset.tab || 'skills';
+        agentCapRefresh();
+        break;
+      case 'cap-skill-use': {
+        const s = (AG_CAP.skills || []).find(x => x.id === el.dataset.id);
+        closeModal();
+        const inp = $('#agentInput');
+        if(inp && s){ inp.value = `用技能「${s.name || s.id}」跑一遍`; inp.focus(); }
+        break;
+      }
+      case 'cap-skill-del': {
+        const id = el.dataset.id;
+        if(!confirm('删除技能「' + id + '」？只删这个流程，不影响账本数据。')) break;
+        await jpost(`/api/agent/skills/${encodeURIComponent(id)}/delete`, {});
+        await agentCapRefresh();
+        break;
+      }
+      case 'cap-mcp-connect': {
+        const nm = el.dataset.id;
+        btnBusy(el, '连接中…');
+        let d;
+        try{ d = await jpost(`/api/agent/mcp/${encodeURIComponent(nm)}/connect`, {}); }
+        catch(err){ d = {ok: false, error: err.message}; }
+        if(!d.ok) alert('连接失败：\n' + (d.error || '未知错误'));
+        await agentCapRefresh();
+        break;
+      }
+      case 'cap-mcp-del': {
+        const nm = el.dataset.id;
+        if(!confirm(`删除 MCP 服务器「${nm}」？只是不再挂载，不会卸载它本身。`)) break;
+        await jdel(`/api/agent/mcp/${encodeURIComponent(nm)}`);
+        await agentCapRefresh();
+        break;
+      }
+      case 'cap-mcp-save': agentCapMcpSave(); break;
       case 'prop-expand': {
         const p = agProp(el.dataset.mi, el.dataset.pi);
         if(!p) break;

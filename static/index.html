@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>日记账 BI 系统</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="style.css?v=2.11.0">
+<link rel="stylesheet" href="style.css?v=2.12.0">
 </head>
 <body>
 <div id="app">
@@ -21,7 +21,7 @@
     <nav id="nav">
       <button class="nav-btn active" data-action="nav" data-view="dashboard">📊 总览看板</button>
       <button class="nav-btn" data-action="reminders">🔔 待办提醒</button>
-      <button class="nav-btn" data-action="agent-toggle" id="navAgent">🤖 AI 查账助手</button>
+      <button class="nav-btn" data-action="agent-toggle" id="navAgent">🤖 Agent</button>
       <button class="nav-btn" data-action="nav" data-view="journal">📖 日记账</button>
       <button class="nav-btn" data-action="nav" data-view="cash">💵 现金管理</button>
       <button class="nav-btn" data-action="nav" data-view="deposits">💰 定期存款</button>
@@ -46,8 +46,9 @@
 </div>
 <div id="modalOverlay" class="hidden"><div id="modalBox"></div></div>
 
-<!-- AI 查账助手（右侧抽屉，随时可唤起） -->
-<button id="agentFab" class="agent-fab" data-action="agent-toggle" title="AI 查账助手（Alt+A）">🤖</button>
+<!-- Agent（右侧抽屉，不遮挡主页面） -->
+<button id="agentFab" class="agent-fab" data-action="agent-toggle" title="Agent（Alt+A）">🤖</button>
+<div id="agentMask" class="agent-mask" data-action="agent-toggle"></div>
 <aside id="agentDock" class="agent-dock" aria-hidden="true">
   <div class="agent-grip" id="agentGrip" title="拖动调整宽度"></div>
   <div class="agent-side" id="agentSide"></div>
@@ -55,10 +56,11 @@
   <div class="agent-head">
     <div class="agent-head-l">
       <button class="btn sm" data-action="agent-side" title="历史对话（新建 / 切换 / 删除）">☰</button>
-      <b>🤖 查账助手</b>
+      <b>🤖 Agent</b>
       <span class="muted small" id="agentModelHint"></span>
     </div>
     <div class="row" style="gap:6px;flex-wrap:nowrap">
+      <button class="btn sm" data-action="agent-capabilities" title="技能与 MCP 工具">🧩</button>
       <select id="agentModeSel" class="agent-mode-sel" title="AI 访问模式">
         <option value="ask">逐条确认</option>
       </select>
@@ -79,7 +81,7 @@
   </div>
 </aside>
 
-<script src="app.js?v=2.11.0"></script>
+<script src="app.js?v=2.12.0"></script>
 <script>
 /* 深链接：#agent 直接打开助手（方便收藏 / 排查问题） */
 if(/[#&]agent/.test(location.hash)){

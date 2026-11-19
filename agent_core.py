@@ -155,6 +155,7 @@ def pick_tools(names, allow_write=False):
     """装配这一轮的工具清单。
 
     只读模式下无论调用方怎么要求，都不下发写工具——这是模式闸门，不是建议。
+    可写模式下把已连接的 MCP 工具一并挂上（命名 mcp__服务器__工具）。
     """
     try:
         from agent_perm import allow_write_tools
@@ -162,8 +163,17 @@ def pick_tools(names, allow_write=False):
             allow_write = False
     except Exception:
         pass
-    pool = TOOLS if allow_write else [
-        t for t in TOOLS if t['function']['name'] not in WRITE_NAMES]
+    base = TOOLS
+    if allow_write:
+        try:
+            from agent_mcp import tools as _mcp_tools
+            extra = _mcp_tools()
+            if extra:
+                base = TOOLS + extra
+        except Exception:
+            base = TOOLS
+    pool = base if allow_write else [
+        t for t in base if t['function']['name'] not in WRITE_NAMES]
     if names is None:
         return pool
     keep = set(names) | {'show_links'}
@@ -401,13 +411,31 @@ def skill_block():
         return ''
 
 
+def mcp_block():
+    """已连接的 MCP 工具清单。只报名字，schema 走工具定义本身。"""
+    try:
+        from agent_mcp import status
+        rows = [s for s in status()['servers'] if s.get('connected') and s.get('tools')]
+    except Exception:
+        return ''
+    if not rows:
+        return ''
+    lines = ['', '## 外部 MCP 工具（名字以 mcp__ 开头）']
+    for s in rows:
+        names = '、'.join(t['name'] for t in s['tools'][:15])
+        lines.append(f"- `{s['name']}`：{names}")
+    lines.append('这些工具直接作用在外部系统上，本系统无法撤销，也不受「撤销这次」保护。'
+                 '调用前先说你打算做什么；结果很长时只摘要点，不要把原文整段贴出来。')
+    return '\n'.join(lines)
+
+
 def build_system(sid, company, att_block=''):
     try:
         tmpl = load_system_template()
     except Exception:
         tmpl = ''
     extra = ((att_block or '') + perm_block() + facts_block(sid)
-             + pending_block(sid) + skill_block())
+             + pending_block(sid) + skill_block() + mcp_block())
     out = tmpl.replace('{today}', date.today().isoformat())
     out = out.replace('{company}', company or '（未设置）')
     out = out.replace('{extra}', extra)
@@ -568,9 +596,6 @@ def digest_of(name, args, result):
 
 
 def run_tool(name, args, sid=''):
-    impl = TOOL_IMPL.get(name)
-    if not impl:
-        return {'error': f'未知工具 {name}'}, []
     t0 = time.time()
     # 剥离模型传来的内部键（__sid / __approved 之类只能由服务端注入），
     # 否则模型传一句 __approved=true 就能跳过审核卡。
@@ -578,6 +603,21 @@ def run_tool(name, args, sid=''):
          if isinstance(args, dict) else {})
     if sid:
         a['__sid'] = sid          # 写入工具靠它把草稿挂到当前会话
+
+    if str(name).startswith('mcp__'):
+        try:
+            from agent_mcp import call as _mcp_call
+            text, is_err = _mcp_call(name, a)
+        except Exception as exc:
+            text, is_err = f'{type(exc).__name__}: {exc}', True
+        res = {'mcp': True, 'result': text}
+        if is_err:
+            res['error'] = text
+        return res, [], int((time.time() - t0) * 1000)
+
+    impl = TOOL_IMPL.get(name)
+    if not impl:
+        return {'error': f'未知工具 {name}'}, [], 0
     try:
         result, links = impl(a)
     except Exception as exc:
@@ -904,6 +944,143 @@ def get_file(fid):
         return serve_file(fid)
     except Exception as exc:
         return jsonify({'error': str(exc)}), 404
+
+
+@bp.get('/api/agent/skills')
+def api_skills():
+    """技能清单：给前端展示，不占模型上下文。"""
+    try:
+        import agent_skill as SK
+        out = []
+        for s in SK.all_skills():
+            out.append({
+                'id': s.get('id'),
+                'name': s.get('name') or s.get('id'),
+                'when': s.get('when') or '',
+                'desc': s.get('desc') or '',
+                'params': s.get('params') or {},
+                'steps': [{'tool': st.get('tool'),
+                           'label': st.get('label') or st.get('tool')}
+                          for st in (s.get('steps') or [])],
+            })
+        return jsonify({'ok': True, 'count': len(out), 'items': out})
+    except Exception as exc:
+        return jsonify({'ok': False,
+                        'error': f'{type(exc).__name__}: {exc}'}), 500
+
+
+@bp.post('/api/agent/skills/<path:sid>/delete')
+def api_skill_delete(sid):
+    try:
+        import agent_skill as SK
+        if not SK.remove(sid):
+            return jsonify({'ok': False, 'error': f'没有叫 {sid} 的技能'}), 404
+        return jsonify({'ok': True, 'removed': sid})
+    except Exception as exc:
+        return jsonify({'ok': False,
+                        'error': f'{type(exc).__name__}: {exc}'}), 500
+
+
+@bp.get('/api/agent/peek/entry/<int:eid>')
+def api_peek_entry(eid):
+    """只读预览一笔流水：点 Agent 回答里的链接时弹出来看，不动主页面。"""
+    from agent import one, rows as _rows
+    try:
+        r = one('SELECT e.*, a.name AS account_name, a.currency, a.company_id, '
+                'c.name AS company_name FROM entries e '
+                'JOIN accounts a ON a.id = e.account_id '
+                'JOIN companies c ON c.id = a.company_id WHERE e.id = ?', (eid,))
+    except Exception as exc:
+        return jsonify({'error': f'{type(exc).__name__}: {exc}'}), 500
+    if not r:
+        return jsonify({'error': '这笔流水不存在，可能已被删除'}), 404
+    try:
+        r['tags'] = [t['name'] for t in _rows(
+            'SELECT t.name FROM tags t JOIN entry_tags et ON et.tag_id = t.id '
+            'WHERE et.entry_id = ? ORDER BY t.name', (eid,))]
+        r['attachments'] = _rows(
+            'SELECT id, orig_name, size FROM attachments WHERE entry_id = ? '
+            'ORDER BY id', (eid,))
+    except Exception:
+        r['tags'], r['attachments'] = [], []
+    return jsonify({'ok': True, 'entry': r})
+
+
+@bp.get('/api/agent/peek/account/<int:aid>')
+def api_peek_account(aid):
+    """只读预览一个账户：最近 60 笔 + 合计。"""
+    from agent import one, rows as _rows
+    try:
+        acc = one('SELECT a.*, c.name AS company_name FROM accounts a '
+                  'JOIN companies c ON c.id = a.company_id WHERE a.id = ?', (aid,))
+        if not acc:
+            return jsonify({'error': '这个账户不存在，可能已被删除'}), 404
+        ents = _rows('SELECT id, date, description, party, debit, credit, pending '
+                     'FROM entries WHERE account_id = ? '
+                     'ORDER BY date DESC, id DESC LIMIT 60', (aid,))
+        agg = one('SELECT COUNT(*) n, COALESCE(SUM(debit),0) d, '
+                  'COALESCE(SUM(credit),0) c FROM entries WHERE account_id = ?',
+                  (aid,)) or {}
+    except Exception as exc:
+        return jsonify({'error': f'{type(exc).__name__}: {exc}'}), 500
+    return jsonify({'ok': True, 'account': acc, 'entries': ents,
+                    'summary': {'count': agg.get('n') or 0,
+                                'debit': round(float(agg.get('d') or 0), 2),
+                                'credit': round(float(agg.get('c') or 0), 2)}})
+
+
+@bp.get('/api/agent/mcp')
+def api_mcp_list():
+    try:
+        import agent_mcp as M
+        return jsonify(M.status())
+    except Exception as exc:
+        return jsonify({'servers': [], 'total_tools': 0,
+                        'error': f'{type(exc).__name__}: {exc}'}), 500
+
+
+@bp.post('/api/agent/mcp')
+def api_mcp_save():
+    """新增或修改一个 MCP 服务器。body: {name, command, args, env, enabled}"""
+    data = request.get_json(silent=True) or {}
+    try:
+        import agent_mcp as M
+        M.upsert_server(data.get('name'), data)
+        name = str(data.get('name') or '').strip()
+        try:
+            M.connect(name, force=True)
+        except Exception as exc:
+            return jsonify({'ok': False, 'saved': True,
+                            'error': f'{exc}',
+                            'status': M.status()}), 200
+        return jsonify({'ok': True, 'status': M.status()})
+    except ValueError as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'ok': False,
+                        'error': f'{type(exc).__name__}: {exc}'}), 500
+
+
+@bp.delete('/api/agent/mcp/<path:name>')
+def api_mcp_delete(name):
+    try:
+        import agent_mcp as M
+        if not M.remove_server(name):
+            return jsonify({'ok': False, 'error': f'没有叫 {name} 的服务器'}), 404
+        return jsonify({'ok': True, 'status': M.status()})
+    except Exception as exc:
+        return jsonify({'ok': False,
+                        'error': f'{type(exc).__name__}: {exc}'}), 500
+
+
+@bp.post('/api/agent/mcp/<path:name>/connect')
+def api_mcp_connect(name):
+    try:
+        import agent_mcp as M
+        tools = M.connect(name, force=True)
+        return jsonify({'ok': True, 'count': len(tools), 'status': M.status()})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 200
 
 
 @bp.get('/api/agent/mode')

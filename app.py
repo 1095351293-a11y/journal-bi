@@ -2827,6 +2827,13 @@ try:
 except Exception as _e:
     print('[agent] 导出工具绑定失败:', _e)
 
+# MCP 服务器在后台预热：连不上的只是记下原因，不挡启动、不挡对话。
+try:
+    from agent_mcp import warm as _mcp_warm
+    _mcp_warm()
+except Exception as _e:
+    print('[agent] MCP 预热跳过:', _e)
+
 
 if __name__ == '__main__':
     if os.environ.get('NO_BROWSER') != '1':
