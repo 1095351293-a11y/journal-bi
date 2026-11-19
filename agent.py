@@ -845,6 +845,16 @@ try:
 except Exception as _e:
     print('[agent] 技能工具未加载:', _e)
 
+# 说明型技能的脚本执行器：只跑 skills/<id>/scripts/ 里已有的文件，AI 造不出脚本
+try:
+    from agent_script import (IMPL as SCRIPT_IMPL, LABELS as SCRIPT_LABELS,
+                              TOOLS as SCRIPT_TOOLS)
+    TOOLS.extend(SCRIPT_TOOLS)
+    TOOL_IMPL.update(SCRIPT_IMPL)
+    TOOL_LABEL.update(SCRIPT_LABELS)
+except Exception as _e:
+    print('[agent] 脚本执行工具未加载:', _e)
+
 # 这些工具会改账本或系统结构：查询轮次不给它们，写成功才标脏
 # propose_merge_entries 之前漏在这里，导致合并后不触发 sess_mark_dirty、
 # 纯查询轮次也会把它挂上来。合并是写操作，必须归位。
@@ -853,7 +863,9 @@ WRITE_NAMES = {'propose_entry', 'propose_update_entry', 'propose_update_entries'
                'import_file', 'propose_import',
                'undo_write', 'manage_company', 'manage_account', 'manage_tag',
                'manage_deposit', 'set_exchange_rates', 'manage_cash_count',
-               'delete_attachment', 'backup_now'}
+               'delete_attachment', 'backup_now',
+               # 跑脚本 = 这台机器上真的起进程，只读模式一定不能下发
+               'run_script', 'check_script'}
 
 SYSTEM_PROMPT = """你是「日记账 BI 系统」内置的查账助手，服务对象是企业的财务人员。
 

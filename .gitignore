@@ -10,6 +10,12 @@ data/agent_admin_log.jsonl
 data/agent_perm.json
 data/*.xlsx
 data/_t_*
+data/skills/
+data/mcp.json
+data/exports/
+data/script_jobs/
+data/imports/
+data/fsc_profile/
 
 # 只保留占位文件，保证 data/ 目录存在
 !data/.gitkeep

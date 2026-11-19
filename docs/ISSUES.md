@@ -7,6 +7,24 @@
 
 ## 2026-11-19
 
+### 8. 想用 fsc-boe-extract 这类要跑脚本的技能，还要能 / 调用
+
+- **现象**：① 在 WorkBuddy 里写好的 `fsc-boe-extract`（接管 Edge 抓共享中心报账单）搬不进本系统；② 技能与 MCP 只能点 🧩 弹窗看，弹窗还挡住页面；③ 想在输入框打 `/技能名` 直接调用。
+- **原因**：
+  1. `agent_skill.py` 只认「按顺序调已注册工具」的声明式 JSON，跑不了需要起进程、等人扫码登录的活；而且技能只从 `data/skills/*.json` 读，不认目录形式。
+  2. 🧩 走的是通用 `openModal`，天生覆盖主页面。
+  3. 完全没有斜杠命令的解析。
+- **解决**：
+  - **技能分两种**：`steps`（流程型，原样保留）与 `guide`（说明型：一段 Markdown + 可选 `scripts/`）。说明型 `run_skill` 只回手册正文，不执行任何东西。
+  - **技能目录**：新增仓库内 `skills/`（随代码发布、只读），`data/skills/` 为用户技能，同 id 用户覆盖内置；支持 `<id>/skill.json` 目录结构。内置技能禁止删除（接口返 400）。
+  - **脚本执行器**（新文件 `agent_script.py`）：只能跑 `skills/<id>/scripts/` 下、扩展名在 `.py/.sh/.bat/.cmd` 白名单内的文件，`realpath` 必须落在该目录内（越界直接拒）。默认后台跑，返回 `job_id`，`check_script` 轮询日志尾部并支持终止——抓单据含「等用户登录」的阻塞，前台会把整轮对话卡死。参数里的 `{data}` 替换成系统数据目录绝对路径。
+  - **权限**：`run_script` / `check_script` 进 `agent.WRITE_NAMES`，只读模式不下发；工具内部再查一次 `allow_write_tools()`；流程型技能里 `BLOCKED` 掉，脚本只能由主对话明着起。
+  - **搬入 fsc-boe-extract**：`skills/fsc-boe-extract/`（skill.json + SKILL.md + 5 个脚本 + 字段对照表），`when` 写用户原话，`run_fsc.py` 用 `--out {data}/imports/fsc --work-dir {data}/fsc_profile` 保证产物与登录态都落在数据目录。
+  - **斜杠命令**：输入框打 `/` 弹出技能列表（↑↓ 选、Enter/Tab 填入、Esc 收起，模糊匹配 id/名称/触发场景）。后端 `expand_slash()` 把 `/id 后面的话` 改写成一句明确指令再交给模型，不引入「当前激活技能」这类隐藏状态。
+  - **面板改内嵌**：能力面板从 `openModal` 改成抽屉内 `.agent-cap` 滑出层（`agentCapOpen/agentCapClose`），只占 Agent 自己的宽度；输入框左侧新加 🧩 按钮，与头部入口同一个动作。
+- **涉及**：`agent_script.py`（新）、`agent_skill.py`、`agent_core.py`、`agent.py`、`skills/fsc-boe-extract/**`（新）、`static/index.html`、`static/app.js`、`static/style.css`、`.gitignore`
+- **提交**：本次
+
 ### 7. Agent 面板挡页面、点链接就把对话关了、看不到技能、没有 MCP
 
 - **现象**：四个问题——① 打开助手后右侧像被盖住，主页面表格挤成一条；② 点回答里的流水链接，助手整个收起，回来还得重新找会话；③ 不知道 AI 到底存了哪些技能；④ 只能用它内置的 36 个工具，接不了外部 MCP。

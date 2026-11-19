@@ -411,6 +411,38 @@ def skill_block():
         return ''
 
 
+_RE_SLASH = re.compile(r'^\s*/([A-Za-z][A-Za-z0-9_.-]*)\s*([\s\S]*)$')
+
+
+def expand_slash(text):
+    """输入框里打 ``/技能id 后面跟一句话`` → 变成一句明确的指令。
+
+    不发明新协议，只是把话说明白，让模型照常调 run_skill。这样斜杠命令和自然
+    语言走同一条路，不引入第二套隐藏状态（也就不用维护「当前激活技能」）。
+    返回 (改写后的文本, 命中的技能或 None)。
+    """
+    m = _RE_SLASH.match(text or '')
+    if not m:
+        return text, None
+    key, rest = m.group(1), (m.group(2) or '').strip()
+    try:
+        import agent_skill as SK
+        sk = SK.find(key)
+    except Exception:
+        sk = None
+    if not sk:
+        return text, None
+    kind = sk.get('kind') or 'steps'
+    tail = (f'用户后面还说：{rest}' if rest
+            else '用户没附加说明，按技能默认方式执行；需要参数就先问。')
+    new = (f'[用户用 /{sk["id"]} 调用了技能「{sk.get("name") or sk["id"]}」'
+           f'（{"说明型" if kind == "guide" else "流程型"}）。'
+           f'现在先调用 run_skill(id="{sk["id"]}")：'
+           f'流程型直接汇报每步结果，说明型读完手册照做、需要跑脚本用 run_script。'
+           f'{tail}]')
+    return new, {'id': sk['id'], 'name': sk.get('name'), 'kind': kind}
+
+
 def mcp_block():
     """已连接的 MCP 工具清单。只报名字，schema 走工具定义本身。"""
     try:
@@ -888,6 +920,7 @@ def chat_stream():
     text = str(data.get('message') or '').strip()
     if not text:
         return jsonify({'error': '请输入问题'}), 400
+    text, _slash = expand_slash(text)      # /技能id → 明确的调用指令
     cfg = load_config()
     err = _cfg_ready(cfg)
     if err:
@@ -956,9 +989,14 @@ def api_skills():
             out.append({
                 'id': s.get('id'),
                 'name': s.get('name') or s.get('id'),
+                'kind': s.get('kind') or 'steps',
+                'builtin': bool(s.get('_builtin') and not os.path.exists(
+                    os.path.join(SK.SKILL_DIR, str(s.get('id')) + '.json'))),
                 'when': s.get('when') or '',
                 'desc': s.get('desc') or '',
                 'params': s.get('params') or {},
+                'scripts': SK.scripts_of(s),
+                'refs': SK.refs_of(s),
                 'steps': [{'tool': st.get('tool'),
                            'label': st.get('label') or st.get('tool')}
                           for st in (s.get('steps') or [])],
@@ -973,6 +1011,9 @@ def api_skills():
 def api_skill_delete(sid):
     try:
         import agent_skill as SK
+        if SK.is_builtin(sid):
+            return jsonify({'ok': False,
+                            'error': f'{sid} 是随系统发布的技能，不能删；不想用就别调它'}), 400
         if not SK.remove(sid):
             return jsonify({'ok': False, 'error': f'没有叫 {sid} 的技能'}), 404
         return jsonify({'ok': True, 'removed': sid})

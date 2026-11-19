@@ -514,7 +514,7 @@ body.agent-open .agent-fab{opacity:0;pointer-events:none;transform:scale(.8)}
 
 /* ====== 会话历史侧栏 ====== */
 .agent-dock{flex-direction:row;transform:translateX(calc(100% + 40px))}
-.agent-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
+.agent-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden;position:relative}
 .agent-side{flex:0 0 0;width:0;overflow:hidden;background:#f8fafc;
   border-right:1px solid var(--line);display:flex;flex-direction:column;
   transition:flex-basis .2s ease,width .2s ease}
@@ -803,3 +803,34 @@ body.agent-open.side-open #main{margin-right:calc(var(--agent-w) + 210px)}
 .cap-form{display:grid;grid-template-columns:120px 1fr;gap:8px 10px;margin-top:12px}
 .cap-form label{font-size:13px;color:var(--muted);padding-top:8px}
 .cap-form .inp{width:100%}
+
+/* ---------------- 技能 / MCP 面板：抽屉内滑出，不弹窗、不遮挡主页面 ---------------- */
+.agent-cap{position:absolute;inset:0;z-index:6;background:var(--card);
+  display:flex;flex-direction:column;
+  transform:translateX(103%);transition:transform .22s cubic-bezier(.4,0,.2,1);
+  box-shadow:-6px 0 18px rgba(15,23,42,.06)}
+.agent-cap.show{transform:none}
+.agent-cap-h{display:flex;align-items:center;gap:8px;padding:11px 14px;
+  border-bottom:1px solid var(--line);flex:0 0 auto}
+.agent-cap-h b{font-size:14px}
+.agent-cap-body{flex:1;overflow-y:auto;padding:14px}
+
+/* ---------------- 斜杠命令：输入 / 弹出技能列表 ---------------- */
+.agent-slash{position:absolute;left:12px;right:12px;bottom:70px;z-index:7;
+  max-height:min(46vh,340px);overflow-y:auto;background:var(--card);
+  border:1px solid var(--line);border-radius:12px;
+  box-shadow:0 12px 32px rgba(15,23,42,.14);padding:6px}
+.agent-slash[hidden]{display:none}
+.sl-h{font-size:11.5px;color:var(--muted);padding:6px 8px 4px}
+.sl-item{display:flex;gap:10px;align-items:flex-start;padding:8px 9px;border-radius:8px;cursor:pointer}
+.sl-item:hover,.sl-item.on{background:var(--bg)}
+.sl-ico{flex:0 0 auto;font-size:14px;line-height:1.5}
+.sl-txt{min-width:0}
+.sl-nm{font-weight:600;font-size:13px}
+.sl-id{color:var(--muted);font-size:11.5px;font-weight:400;margin-left:6px}
+.sl-when{color:var(--muted);font-size:12px;margin-top:2px;line-height:1.5;
+  overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.sl-none{padding:14px;text-align:center;color:var(--muted);font-size:12.5px;line-height:1.8}
+.ag-kind{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;
+  background:var(--blue-soft);color:var(--blue);font-weight:600;vertical-align:middle}
+.ag-kind.guide{background:#fef3c7;color:#b45309}

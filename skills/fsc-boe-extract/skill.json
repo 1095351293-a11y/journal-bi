@@ -1,0 +1,17 @@
+{
+  "id": "fsc-boe-extract",
+  "name": "共享中心单据提取",
+  "kind": "guide",
+  "desc": "接管本机已登录的 Edge，批量抓 FSC 报账单详情，解析成明细表",
+  "when": "用户说「从共享中心抓单据」「导出报账单」「批量取单据详情」「共享中心第几到第几行」「接管我的浏览器」时",
+  "scripts": [
+    "run_fsc.py",
+    "attach_edge.py",
+    "grab_boe.py",
+    "parse_boe.py",
+    "peek.py"
+  ],
+  "refs": [
+    "fsc-fields.md"
+  ]
+}

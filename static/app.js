@@ -64,6 +64,8 @@ document.addEventListener('keydown', e=>{
   }
   if(e.key === 'Escape'){
     if(!overlay.classList.contains('hidden')){ closeModal(); return; }
+    if(SL && SL.open){ slashHide(); return; }
+    try{ if(agentCapIsOpen()){ agentCapClose(); return; } }catch(_){}
     if($('#agentDock')?.classList.contains('open')) agentClose();
   }
 });
@@ -3483,6 +3485,7 @@ async function agentSend(text){
   const atts = (S.agent.atts || []).slice();
   if(!msg && !atts.length) return;
   if(input) input.value = '';
+  slashHide();
   S.agent.atts = []; agentPaintAtts();
   const history = S.agent.msgs
     .filter(m => !m.streaming && !m.error && (m.role === 'user' || (m.role === 'assistant' && m.content)))
@@ -3685,6 +3688,8 @@ function agentClose(){
   const dock = $('#agentDock');
   if(!dock) return;
   dock.classList.remove('open');
+  try{ agentCapClose(); }catch(e){}
+  try{ slashHide(); }catch(e){}
   agentRelayout();
   dock.setAttribute('aria-hidden', 'true');
   document.body.classList.remove('agent-open');
@@ -3702,8 +3707,23 @@ let AG_CAP = {tab: 'skills', skills: [], mcp: null, loading: false};
 
 async function agentCapOpen(tab){
   AG_CAP.tab = tab || 'skills';
-  openModal(modalHead('🧩 技能与 MCP') + '<div id="capBody" class="cap-empty">加载中…</div>');
+  if(!($('#agentDock') || {}).classList?.contains('open')) agentOpen();
+  const box = $('#agentCap');
+  if(box){ box.classList.add('show'); box.setAttribute('aria-hidden', 'false'); }
+  const body = $('#capBody');
+  if(body){ body.classList.add('cap-empty'); body.textContent = '加载中…'; }
   await agentCapRefresh();
+}
+
+function agentCapClose(){
+  const box = $('#agentCap');
+  if(box){ box.classList.remove('show'); box.setAttribute('aria-hidden', 'true'); }
+  setTimeout(()=>{ if(!agentIsNarrow()) $('#agentInput')?.focus(); }, 200);
+}
+
+function agentCapIsOpen(){
+  const box = $('#agentCap');
+  return !!(box && box.classList.contains('show'));
 }
 
 async function agentCapRefresh(){
@@ -3725,7 +3745,7 @@ async function agentCapRefresh(){
     <button class="cap-tab ${tab==='mcp'?'on':''}" data-action="cap-tab" data-tab="mcp">MCP${nm?` · ${nm}`:''}</button>
   </div>`;
   html += tab === 'skills' ? capSkillsHTML() : capMcpHTML();
-  body.className = '';
+  body.classList.remove('cap-empty');
   body.innerHTML = html;
 }
 
@@ -3734,23 +3754,34 @@ function capSkillsHTML(){
   if(!items.length){
     return `<div class="cap-empty">还没有技能。<br>
       在对话里说「以后月末都这样做：先查未兑现、再列待跟进」，<br>
-      AI 会把这几步存成技能，存好后出现在这里。</div>`;
+      AI 会把这几步存成技能；也可以直接在输入框打 <b>/</b> 调用。</div>`;
   }
-  return items.map(s => `<div class="cap-item">
-    <div class="cap-h">
-      <div>
-        <div class="cap-name">${esc(s.name || s.id)}</div>
-        <div class="cap-when">${esc(s.when || s.desc || '（没写触发场景）')}</div>
+  return items.map(s => {
+    const isGuide = s.kind === 'guide';
+    const tag = isGuide ? '<span class="ag-kind guide">说明型</span>'
+                        : '<span class="ag-kind">流程型</span>';
+    const chain = isGuide
+      ? (s.scripts || []).map(x => `<span class="cap-step">${esc(x)}</span>`).join('')
+      : (s.steps || []).map((st, i) =>
+          `<span class="cap-step">${i + 1}. ${esc(st.label || st.tool)}</span>`).join('');
+    const del = s.builtin ? ''
+      : `<button class="btn sm danger" data-action="cap-skill-del" data-id="${esc(s.id)}">删除</button>`;
+    return `<div class="cap-item">
+      <div class="cap-h">
+        <div style="min-width:0">
+          <div class="cap-name">${esc(s.name || s.id)} ${tag}</div>
+          <div class="cap-when">/${esc(s.id)} · ${esc(s.when || s.desc || '（没写触发场景）')}</div>
+        </div>
+        <div class="row" style="gap:6px;flex-wrap:nowrap">
+          <button class="btn sm" data-action="cap-skill-use" data-id="${esc(s.id)}">用一下</button>
+          ${del}
+        </div>
       </div>
-      <div class="row" style="gap:6px;flex-wrap:nowrap">
-        <button class="btn sm" data-action="cap-skill-use" data-id="${esc(s.id)}">用一下</button>
-        <button class="btn sm danger" data-action="cap-skill-del" data-id="${esc(s.id)}">删除</button>
-      </div>
-    </div>
-    <div class="cap-steps">${(s.steps || []).map((st, i) =>
-      `<span class="cap-step">${i + 1}. ${esc(st.label || st.tool)}</span>`).join('')}</div>
-  </div>`).join('') + `<div class="hint" style="margin-top:6px">
-    技能只能按顺序调用已有工具，不能写代码、不能算数、不能直接改数据库。</div>`;
+      ${chain ? `<div class="cap-steps">${chain}</div>` : ''}
+    </div>`;
+  }).join('') + `<div class="hint" style="margin-top:6px">
+    流程型技能只能按顺序调用已有工具；说明型的脚本只能跑技能目录里自带的文件。
+    在输入框打 <b>/</b> 可以直接调用。</div>`;
 }
 
 function capMcpHTML(){
@@ -3791,9 +3822,8 @@ function capMcpHTML(){
       <label>参数</label><input class="inp" id="mcpArgs" placeholder="-y @modelcontextprotocol/server-filesystem C:\\data">
       <label>环境变量</label><input class="inp" id="mcpEnv" placeholder="KEY=VALUE，多个用 ; 分隔">
     </div>
-    <div class="modal-actions">
+    <div class="row" style="margin-top:10px">
       <button class="btn primary" data-action="cap-mcp-save">添加并连接</button>
-      <button class="btn" data-action="modal-close">关闭</button>
     </div>`;
 }
 
@@ -3805,6 +3835,79 @@ function capSplitArgs(s){
     out.push(m[1] ?? m[2] ?? m[3]);
   }
   return out;
+}
+
+/* ---------------------------------------------------------------- 斜杠命令
+   输入框打 / 就列出技能，选中后填成「/技能id 」，后面可以接着写一句话。
+   后端把 /id 改写成明确指令再交给模型，不维护「当前激活技能」这种隐藏状态。 */
+let SL = {open: false, items: [], idx: 0};
+
+async function slashLoad(force){
+  if((AG_CAP.skills || []).length && !force) return AG_CAP.skills;
+  try{
+    const d = await api('/api/agent/skills');
+    AG_CAP.skills = d.items || [];
+  }catch(e){ AG_CAP.skills = AG_CAP.skills || []; }
+  return AG_CAP.skills;
+}
+
+function slashQuery(){
+  const ta = $('#agentInput');
+  const v = ta ? ta.value : '';
+  const m = /^\/([A-Za-z0-9_.-]*)$/.exec(v);
+  return m ? m[1].toLowerCase() : null;
+}
+
+async function slashMaybe(){
+  const q = slashQuery();
+  const box = $('#agentSlash');
+  if(!box) return;
+  if(q === null){ slashHide(); return; }
+  await slashLoad();
+  const items = (AG_CAP.skills || []).filter(s =>
+    !q || String(s.id).toLowerCase().includes(q) ||
+    String(s.name || '').toLowerCase().includes(q) ||
+    String(s.when || '').toLowerCase().includes(q));
+  SL.items = items; SL.idx = 0;
+  if(!items.length){
+    box.innerHTML = `<div class="sl-none">没有匹配的技能。<br>点 🧩 看现有技能，或在对话里让 AI 存一个。</div>`;
+    box.hidden = false; SL.open = true; return;
+  }
+  box.innerHTML = `<div class="sl-h">技能（↑↓ 选择 · Enter 填入 · Esc 收起）</div>` +
+    items.slice(0, 20).map((s, i) => `<div class="sl-item${i === 0 ? ' on' : ''}"
+        data-action="slash-pick" data-id="${esc(s.id)}">
+      <div class="sl-ico">${s.kind === 'guide' ? '📘' : '⚡'}</div>
+      <div class="sl-txt">
+        <div class="sl-nm">${esc(s.name || s.id)}<span class="sl-id">/${esc(s.id)}</span></div>
+        <div class="sl-when">${esc(s.when || s.desc || '')}</div>
+      </div>
+    </div>`).join('');
+  box.hidden = false; SL.open = true;
+}
+
+function slashHide(){
+  const box = $('#agentSlash');
+  if(box){ box.hidden = true; box.innerHTML = ''; }
+  SL.open = false; SL.items = []; SL.idx = 0;
+}
+
+function slashPick(id){
+  const ta = $('#agentInput');
+  if(!ta || !id) return;
+  ta.value = '/' + id + ' ';
+  slashHide();
+  ta.focus();
+  try{ ta.selectionStart = ta.selectionEnd = ta.value.length; }catch(e){}
+}
+
+function slashMove(delta){
+  if(!SL.open || !SL.items.length) return;
+  SL.idx = (SL.idx + delta + SL.items.length) % SL.items.length;
+  const box = $('#agentSlash');
+  if(!box) return;
+  box.querySelectorAll('.sl-item').forEach((el, i) => el.classList.toggle('on', i === SL.idx));
+  const cur = box.querySelectorAll('.sl-item')[SL.idx];
+  if(cur && cur.scrollIntoView) cur.scrollIntoView({block: 'nearest'});
 }
 
 function btnBusy(el, text){
@@ -3915,12 +4018,27 @@ async function initAgentDock(){
   const ta = $('#agentInput');
   if(ta){
     ta.addEventListener('keydown', e=>{
+      if(SL.open){
+        if(e.key === 'ArrowDown'){ e.preventDefault(); slashMove(1); return; }
+        if(e.key === 'ArrowUp'){ e.preventDefault(); slashMove(-1); return; }
+        if(e.key === 'Tab'){ e.preventDefault();
+          if(SL.items[SL.idx]) slashPick(SL.items[SL.idx].id); return; }
+        if(e.key === 'Escape'){ e.preventDefault(); slashHide(); return; }
+        if(e.key === 'Enter' && !e.shiftKey){
+          e.preventDefault();
+          if(SL.items[SL.idx]) slashPick(SL.items[SL.idx].id);
+          else { slashHide(); agentSend(); }
+          return;
+        }
+      }
       if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); agentSend(); }
     });
     ta.addEventListener('input', ()=>{
       ta.style.height = 'auto';
       ta.style.height = Math.min(120, ta.scrollHeight) + 'px';
+      slashMaybe();
     });
+    ta.addEventListener('blur', ()=>{ setTimeout(slashHide, 120); });
   }
 
   try{
@@ -4066,16 +4184,22 @@ document.addEventListener('click', async e=>{
         agentSaveMsgs(); agentPaintAtts(); agentPaint(); break;
       }
       case 'agent-settings': agentClose(); switchView('settings'); break;
-      case 'agent-capabilities': agentCapOpen('skills'); break;
+      case 'agent-capabilities': agentCapOpen(AG_CAP.tab || 'skills'); break;
+      case 'cap-close': agentCapClose(); break;
+      case 'slash-pick': slashPick(el.dataset.id); break;
       case 'cap-tab':
         AG_CAP.tab = el.dataset.tab || 'skills';
         agentCapRefresh();
         break;
       case 'cap-skill-use': {
         const s = (AG_CAP.skills || []).find(x => x.id === el.dataset.id);
-        closeModal();
+        agentCapClose();
         const inp = $('#agentInput');
-        if(inp && s){ inp.value = `用技能「${s.name || s.id}」跑一遍`; inp.focus(); }
+        if(inp && s){
+          inp.value = '/' + s.id + ' ';
+          inp.focus();
+          try{ inp.selectionStart = inp.selectionEnd = inp.value.length; }catch(e){}
+        }
         break;
       }
       case 'cap-skill-del': {
