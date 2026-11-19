@@ -1229,6 +1229,16 @@ def apply_proposal(pid, edits=None, ack=False):
     if p['danger'] and not ack:
         return {'error': '这是删除操作，需要先勾选「我已核对，确认删除」'}, 400
 
+    # 只读模式下连旧的草稿卡也不许执行：
+    # 否则用户切到只读以后，点一张之前生成的卡片照样能改账。
+    try:
+        from agent_perm import allow_write_tools
+        if not allow_write_tools():
+            return {'error': '当前是只读模式，不会改动任何数据。'
+                             '要执行请先在助手右上角把模式切到「逐条确认」以上'}, 403
+    except Exception:
+        pass
+
     if p['kind'] == 'admin':
         return _apply_admin(p)
 
