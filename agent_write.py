@@ -34,6 +34,7 @@ WRITE_LOG = os.path.join(DATA_DIR, 'agent_writes.jsonl')
 MAX_ITEMS = 200           # 单张草稿最多几行，防止一次刷爆
 MAX_DELETE = 20           # 单次删除上限
 MAX_MERGE = 30            # 单次合并上限
+MAX_BULK = 100            # 单次批量改上限
 BIG_AMOUNT = 1000000      # 超过这个金额提醒核对
 PROP_TTL = 6 * 3600       # 草稿 6 小时后作废
 
@@ -213,11 +214,13 @@ def add_proposal(sid, kind, title, items, warnings=None, danger=False):
         # 同一笔流水再次起草修改：旧草稿自动作废，界面上只留最新那张卡片
         superseded = []
         if kind == 'update' and items:
-            eid = items[0].get('entry_id')
+            eids = {x.get('entry_id') for x in items if x.get('entry_id')}
             for old in PROPOSALS.values():
+                old_eids = {x.get('entry_id') for x in (old.get('items') or [])
+                            if x.get('entry_id')}
                 if (old.get('sid') == p['sid'] and old.get('status') == 'pending'
-                        and old.get('kind') == 'update' and old.get('items')
-                        and old['items'][0].get('entry_id') == eid):
+                        and old.get('kind') == 'update' and old_eids
+                        and (old_eids & eids)):
                     old['status'] = 'cancelled'
                     old['replaced_by'] = pid
                     superseded.append(old['pid'])
@@ -539,31 +542,33 @@ def _locate_entry(args):
     return None, f'命中 {len(rr)} 笔，请挑一笔把 entry_id 传进来：{cand}'
 
 
-def w_propose_update(args):
-    sid = str(args.get('__sid') or '')
-    row, err = _locate_entry(args)
-    if err:
-        return {'error': err}, []
-    eid = row['id']
+# ---------------------------------------------------------------- 工具：改（公用）
+_UPD_TEXT = ('description', 'party', 'project', 'note', 'check_no')
+_UPD_LABEL = {'description': '摘要', 'party': '对方', 'project': '项目',
+              'note': '备注', 'check_no': '单据号'}
 
 
+def _update_changes(row, args):
+    """算出一笔流水要改哪些字段（单笔改、批量改共用）。
+
+    返回 (after, changes, warns, tag_state)：
+      tag_state = None           没动标签
+                = {'same': [...]} 动了但结果一样
+                = {'changed': True} 有标签变更（变更已写进 after）
+    用户给的日期认不出来时抛 ValueError。
+    """
     after, changes, warns = {}, [], []
-    tag_same, cur_tags = False, []
-    for k in ('description', 'party', 'project', 'note', 'check_no'):
+    for k in _UPD_TEXT:
         if args.get(k) is not None:
             nv = str(args.get(k) or '').strip()
             if nv != (row[k] or ''):
-                changes.append({'field': k, 'label': {'description': '摘要',
-                                                      'party': '对方',
-                                                      'project': '项目',
-                                                      'note': '备注',
-                                                      'check_no': '票号'}[k],
+                changes.append({'field': k, 'label': _UPD_LABEL[k],
                                 'from': row[k] or '', 'to': nv})
                 after[k] = nv
     if args.get('date') is not None:
         nd = _parse_date(args.get('date'))
         if not nd:
-            return {'error': f'日期认不出来：{args.get("date")!r}'}, []
+            raise ValueError('日期认不出来：%r' % (args.get('date'),))
         if nd != row['date']:
             changes.append({'field': 'date', 'label': '日期',
                             'from': row['date'], 'to': nd})
@@ -580,21 +585,23 @@ def w_propose_update(args):
         amt = abs(_num(args.get('amount')))
         direction = str(args.get('direction') or '').strip().lower()
         old_amt = row['debit'] or row['credit']
-        old_dir = 'in' if row['debit'] else 'out'
-        direction = direction or old_dir
-        nd_debit, nd_credit = (amt, 0.0) if direction in (
-            'in', '收入', '收') else (0.0, amt)
-        if abs(nd_debit - row['debit']) > 0.005 or abs(nd_credit - row['credit']) > 0.005:
+        direction = direction or ('in' if row['debit'] else 'out')
+        nd_debit, nd_credit = ((amt, 0.0) if direction in ('in', '收入', '收')
+                               else (0.0, amt))
+        if (abs(nd_debit - row['debit']) > 0.005
+                or abs(nd_credit - row['credit']) > 0.005):
             changes.append({'field': 'amount', 'label': '金额',
-                            'from': f"{row['currency']} {old_amt:,.2f}",
-                            'to': f"{row['currency']} {amt:,.2f}"})
+                            'from': '%s %s' % (row['currency'], format(old_amt, ',.2f')),
+                            'to': '%s %s' % (row['currency'], format(amt, ',.2f'))})
             after['debit'], after['credit'] = nd_debit, nd_credit
-            warns.append(f'金额会被改写：{old_amt:,.2f} → {amt:,.2f}，请核对')
+            warns.append('金额会被改写：%s → %s，请核对'
+                         % (format(old_amt, ',.2f'), format(amt, ',.2f')))
+    tag_state = None
     if (args.get('tags') is not None or args.get('add_tags')
             or args.get('remove_tags')):
         cur = [r['name'] for r in _fetch(
             'SELECT t.name FROM entry_tags et JOIN tags t ON t.id=et.tag_id '
-            'WHERE et.entry_id=? ORDER BY t.id', (eid,))]
+            'WHERE et.entry_id=? ORDER BY t.id', (row['id'],))]
         if args.get('tags') is not None:
             target = _tag_names(args.get('tags'))
         else:
@@ -611,16 +618,15 @@ def w_propose_update(args):
                             'to': '、'.join(target) or '（清空）'})
             after['tag_ids'] = ids
             after['tag_names'] = names
+            tag_state = {'changed': True}
         else:
-            tag_same, cur_tags = True, cur
-    if not changes:
-        if tag_same:
-            return {'ok': True, 'no_change': True,
-                    'message': f'#{eid} 现在就是这些标签'
-                               f'（{"、".join(cur_tags) or "无"}），没有需要改的'}, []
-        return {'error': '没看出要改什么。请给出至少一个要变更的字段'}, []
+            tag_state = {'same': cur}
+    return after, changes, warns, tag_state
 
-    item = {'entry_id': eid, 'date': row['date'],
+
+def _update_item(row, changes, after):
+    """草稿卡里的一行（单笔、批量共用）。"""
+    return {'entry_id': row['id'], 'date': row['date'],
             'account_id': row['account_id'],
             'account_name': row['account_name'], 'currency': row['currency'],
             'summary': (row['description'] or '')[:40],
@@ -633,12 +639,85 @@ def w_propose_update(args):
             'check_no': row['check_no'] or '',
             'pending': int(row['pending'] or 0),
             'changes': changes, 'after': after}
-    p = add_proposal(sid, 'update', f'修改流水 #{eid}', [item], warns)
+
+
+def w_propose_update(args):
+    sid = str(args.get('__sid') or '')
+    row, err = _locate_entry(args)
+    if err:
+        return {'error': err}, []
+    eid = row['id']
+    try:
+        after, changes, warns, tag_state = _update_changes(row, args)
+    except ValueError as exc:
+        return {'error': str(exc)}, []
+    if not changes:
+        if tag_state and 'same' in tag_state:
+            return {'ok': True, 'no_change': True,
+                    'message': '#%s 现在就是这些标签（%s），没有需要改的'
+                               % (eid, '、'.join(tag_state['same']) or '无')}, []
+        return {'error': '没看出要改什么。请给出至少一个要变更的字段：'
+                         '摘要 / 对方 / 项目 / 备注 / 单据号 / 日期 / 金额 / 状态 / 标签'}, []
+
+    item = _update_item(row, changes, after)
+    p = add_proposal(sid, 'update', '修改流水 #%s' % eid, [item], warns)
     res = {'ok': True, 'pid': p['pid'], 'count': 1,
-           'draft': f"#{eid} " + '；'.join(
-               f"{c['label']} {c['from']} → {c['to']}" for c in changes)[:200],
+           'draft': '#%s ' % eid + '；'.join(
+               '%s %s → %s' % (c['label'], c['from'], c['to'])
+               for c in changes)[:200],
            'warnings': warns,
            'note': '草稿已推给用户确认。不要自行断定已改好。'}
+    res['__ui'] = {'proposal': _ui(p)}
+    return _auto_apply(p, res), []
+
+
+def w_propose_update_bulk(args):
+    """一次把多笔改成同一个值：清空单据号、统一备注/对方/标签、统一置为未兑现等。"""
+    sid = str(args.get('__sid') or '')
+    raw = args.get('entry_ids') or args.get('ids') or []
+    if isinstance(raw, (int, str)):
+        raw = [raw]
+    ids = list(dict.fromkeys(x for x in (_opt_int(v) for v in raw) if x))
+    if not ids:
+        return {'error': '缺少 entry_ids：先用 query_entries 查出要改的几笔'}, []
+    if len(ids) > MAX_BULK:
+        return {'error': '一次最多改 %d 笔，这次给了 %d 笔，请分批'
+                         % (MAX_BULK, len(ids))}, []
+
+    items, warns, skipped, same = [], [], [], 0
+    for eid in ids:
+        row = next(iter(_fetch(
+            'SELECT e.*, a.name AS account_name, a.currency FROM entries e '
+            'JOIN accounts a ON a.id=e.account_id WHERE e.id=?', (eid,))), None)
+        if not row:
+            skipped.append('#%s 不存在' % eid)
+            continue
+        try:
+            after, changes, w2, _ts = _update_changes(row, args)
+        except ValueError as exc:
+            return {'error': str(exc)}, []
+        if not changes:
+            same += 1
+            continue
+        warns.extend(w2)
+        items.append(_update_item(row, changes, after))
+
+    if not items:
+        return {'ok': True, 'no_change': True,
+                'message': '这 %d 笔已经是目标值，没有需要改的（%d 笔无变化）'
+                           % (len(ids), same)}, []
+
+    p = add_proposal(sid, 'update', '批量修改 %d 笔流水' % len(items), items, warns)
+    head = items[0]['changes']
+    res = {'ok': True, 'pid': p['pid'], 'count': len(items),
+           'draft': '%d 笔：' % len(items) + '；'.join(
+               '%s %s → %s' % (c['label'], c['from'], c['to'])
+               for c in head)[:160],
+           'warnings': warns, 'skipped': skipped,
+           'note': '这 %d 笔会被一起改。以返回里的 auto / wid 为准，'
+                   '没有 auto=true 就不要说已经改好。' % len(items)}
+    if same:
+        res['unchanged'] = same
     res['__ui'] = {'proposal': _ui(p)}
     return _auto_apply(p, res), []
 
@@ -1127,71 +1206,74 @@ def apply_proposal(pid, edits=None, ack=False):
                              'direction': 'in' if f['debit'] else 'out',
                              'account_id': f['account_id']})
         elif p['kind'] == 'update':
-            it = p['items'][0]
-            ed = edits.get('0') or edits.get(0) or {}
-            after = dict(it.get('after') or {})
-            for k, v in ed.items():
-                if k in ('description', 'party', 'project', 'note', 'check_no'):
-                    after[k] = str(v or '').strip()
-                elif k == 'date':
-                    nd = _parse_date(v)
-                    if nd:
-                        after['date'] = nd
-            # 卡片上直接改金额/方向/状态（编辑后提交）
-            new_amt = None
-            if ed.get('amount') not in (None, ''):
-                try:
-                    new_amt = abs(float(str(ed.get('amount')).replace(',', '')))
-                except (TypeError, ValueError):
-                    new_amt = None
-            new_dir = str(ed.get('direction') or '').strip().lower()
-            if ed.get('pending') is not None:
-                after['pending'] = 1 if ed.get('pending') else 0
-            row = db.execute('SELECT * FROM entries WHERE id=?',
-                             (it['entry_id'],)).fetchone()
-            if not row:
-                return {'error': f"流水 #{it['entry_id']} 已不存在"}, 404
-            merged = dict(row)
-            merged.update({k: v for k, v in after.items()
-                           if k in ('date', 'debit', 'credit', 'description',
-                                    'party', 'project', 'note', 'check_no',
-                                    'pending')})
-            if new_amt is not None or new_dir in ('in', 'out'):
-                amt = new_amt if new_amt is not None else (
-                    merged['debit'] or merged['credit'])
-                way = new_dir if new_dir in ('in', 'out') else (
-                    'in' if row['debit'] else 'out')
-                merged['debit'], merged['credit'] = (
-                    (round(amt, 2), 0.0) if way == 'in'
-                    else (0.0, round(amt, 2)))
-            merged['pending'] = 1 if int(merged.get('pending') or 0) else 0
-            err, f = A.validate_entry_payload(_entry_payload({
-                'account_id': row['account_id'], 'date': merged['date'],
-                'check_no': merged['check_no'], 'description': merged['description'],
-                'party': merged['party'], 'project': merged['project'],
-                'note': merged['note'], 'debit': merged['debit'],
-                'credit': merged['credit'], 'pending': merged['pending']}))
-            if err:
-                return {'error': err}, 400
-            old_tags = [r['id'] for r in db.execute(
-                'SELECT tag_id AS id FROM entry_tags WHERE entry_id=?',
-                (it['entry_id'],))]
-            db.execute('UPDATE entries SET date=?, check_no=?, description=?, '
-                       'party=?, debit=?, credit=?, pending=?, project=?, note=? '
-                       'WHERE id=?',
-                       (f['date'], f['check_no'], f['description'], f['party'],
-                        f['debit'], f['credit'], f['pending'], f['project'],
-                        f['note'], it['entry_id']))
-            if 'tag_ids' in after or 'tag_names' in after:
-                tids = list(after.get('tag_ids') or []) + _ensure_tags(
-                    db, after.get('tag_names'))
-                A.set_entry_tags(db, it['entry_id'], tids)
-            undo['entries'].append({
-                'id': it['entry_id'], 'before': dict(row), 'tags': old_tags})
-            done.append({'id': it['entry_id'], 'date': f['date'],
-                         'amount': f['debit'] or f['credit'],
-                         'direction': 'in' if f['debit'] else 'out',
-                         'account_id': row['account_id']})
+            # 逐条处理：单笔改、批量改走同一条路径；某一笔失败不影响其它笔
+            for i, it in enumerate(p['items']):
+                ed = edits.get(str(i)) or edits.get(i) or {}
+                after = dict(it.get('after') or {})
+                for k, v in ed.items():
+                    if k in ('description', 'party', 'project', 'note', 'check_no'):
+                        after[k] = str(v or '').strip()
+                    elif k == 'date':
+                        nd = _parse_date(v)
+                        if nd:
+                            after['date'] = nd
+                # 卡片上直接改金额/方向/状态（编辑后提交）
+                new_amt = None
+                if ed.get('amount') not in (None, ''):
+                    try:
+                        new_amt = abs(float(str(ed.get('amount')).replace(',', '')))
+                    except (TypeError, ValueError):
+                        new_amt = None
+                new_dir = str(ed.get('direction') or '').strip().lower()
+                if ed.get('pending') is not None:
+                    after['pending'] = 1 if ed.get('pending') else 0
+                row = db.execute('SELECT * FROM entries WHERE id=?',
+                                 (it['entry_id'],)).fetchone()
+                if not row:
+                    fails.append('#%s 已不存在' % it['entry_id'])
+                    continue
+                merged = dict(row)
+                merged.update({k: v for k, v in after.items()
+                               if k in ('date', 'debit', 'credit', 'description',
+                                        'party', 'project', 'note', 'check_no',
+                                        'pending')})
+                if new_amt is not None or new_dir in ('in', 'out'):
+                    amt = new_amt if new_amt is not None else (
+                        merged['debit'] or merged['credit'])
+                    way = new_dir if new_dir in ('in', 'out') else (
+                        'in' if row['debit'] else 'out')
+                    merged['debit'], merged['credit'] = (
+                        (round(amt, 2), 0.0) if way == 'in'
+                        else (0.0, round(amt, 2)))
+                merged['pending'] = 1 if int(merged.get('pending') or 0) else 0
+                err, f = A.validate_entry_payload(_entry_payload({
+                    'account_id': row['account_id'], 'date': merged['date'],
+                    'check_no': merged['check_no'], 'description': merged['description'],
+                    'party': merged['party'], 'project': merged['project'],
+                    'note': merged['note'], 'debit': merged['debit'],
+                    'credit': merged['credit'], 'pending': merged['pending']}))
+                if err:
+                    fails.append('#%s：%s' % (it['entry_id'], err))
+                    continue
+                old_tags = [r['id'] for r in db.execute(
+                    'SELECT tag_id AS id FROM entry_tags WHERE entry_id=?',
+                    (it['entry_id'],))]
+                db.execute('UPDATE entries SET date=?, check_no=?, description=?, '
+                           'party=?, debit=?, credit=?, pending=?, project=?, note=? '
+                           'WHERE id=?',
+                           (f['date'], f['check_no'], f['description'], f['party'],
+                            f['debit'], f['credit'], f['pending'], f['project'],
+                            f['note'], it['entry_id']))
+                if 'tag_ids' in after or 'tag_names' in after:
+                    tids = list(after.get('tag_ids') or []) + _ensure_tags(
+                        db, after.get('tag_names'))
+                    A.set_entry_tags(db, it['entry_id'], tids)
+                undo['entries'].append({
+                    'id': it['entry_id'], 'before': dict(row), 'tags': old_tags})
+                done.append({'id': it['entry_id'], 'date': f['date'],
+                             'amount': f['debit'] or f['credit'],
+                             'direction': 'in' if f['debit'] else 'out',
+                             'account_id': row['account_id']})
         elif p['kind'] == 'delete':
             for it in p['items']:
                 eid = it['entry_id']
@@ -1480,6 +1562,10 @@ DEFS = [
         'description': '修改一笔已有流水。只传要改的字段。'
                        '定位方式二选一：① entry_id（先用 query_entries 查到，最稳）；'
                        '② keyword（摘要/对方关键词）+ match_date（原日期），命中唯一一笔才生效。'
+                       '可改字段：摘要 description、对方 party、项目 project、备注 note、'
+                       '单据号 check_no、日期 date、金额 amount+direction、状态 pending、标签。'
+                       '**要一次改多笔的同一字段（如「把这 12 笔的单据号清空」）用 '
+                       'propose_update_entries，不要逐笔重复调**。'
                        '改金额时同时给 amount 与 direction。系统按权限策略决定直接写入'
                        '还是生成待确认草稿，以返回的 auto 字段为准。',
         'parameters': {'type': 'object', 'properties': {
@@ -1494,7 +1580,8 @@ DEFS = [
             'party': {'type': 'string'},
             'project': {'type': 'string'},
             'note': {'type': 'string'},
-            'check_no': {'type': 'string'},
+            'check_no': {'type': 'string',
+                         'description': '单据号/票号/支票号；传空字符串即清空'},
             'amount': {'type': 'number', 'description': '新的金额（正数），会改写借贷方'},
             'direction': {'type': 'string', 'enum': ['in', 'out']},
             'pending': {'type': 'boolean'},
@@ -1506,6 +1593,40 @@ DEFS = [
             'remove_tags': {'type': 'array', 'items': {'type': 'string'},
                             'description': '去掉指定标签，其余保留'},
         }, 'required': []}}},
+    {'type': 'function', 'function': {
+        'name': 'propose_update_entries',
+        'description': '批量把多笔流水改成同一个值——一次调用、一次落库、一个可撤销的 wid。'
+                       '典型场景：「把这 12 笔的单据号清空」「这几笔备注都写 X」'
+                       '「这些流水统一标为未兑现」「都加上某标签」。'
+                       '注意：**同一次调用只能给一套值**，每笔改成的值必须相同；'
+                       '要改成不同值请逐笔用 propose_update_entry。'
+                       '可改字段：check_no（单据号，传空串＝清空）、note（备注）、party（对方）、'
+                       'project（项目）、date（统一改成某天）、pending（是否未兑现）、'
+                       'tags/add_tags/remove_tags、amount+direction（金额，慎用）。'
+                       '先用 query_entries 拿到 entry_ids 再调，最多 100 笔。',
+        'parameters': {'type': 'object', 'properties': {
+            'entry_ids': {'type': 'array', 'items': {'type': 'integer'},
+                          'description': '要一起改的流水 id，最多 100 笔'},
+            'check_no': {'type': 'string',
+                         'description': '单据号/票号；传空字符串即清空'},
+            'note': {'type': 'string', 'description': '备注；传空字符串即清空'},
+            'party': {'type': 'string', 'description': '对方名称（统一改成这个）'},
+            'project': {'type': 'string', 'description': '项目（统一改成这个）'},
+            'date': {'type': 'string',
+                     'description': '统一改成哪一天 YYYY-MM-DD'},
+            'pending': {'type': 'boolean',
+                        'description': 'true=标为未兑现/未到账，false=标为已入账'},
+            'tags': {'type': 'array', 'items': {'type': 'string'},
+                     'description': '整体替换标签；传空数组＝清空'},
+            'add_tags': {'type': 'array', 'items': {'type': 'string'},
+                         'description': '追加标签（保留原有）'},
+            'remove_tags': {'type': 'array', 'items': {'type': 'string'},
+                            'description': '去掉指定标签'},
+            'amount': {'type': 'number',
+                       'description': '统一改成的金额（正数）；需同时给 direction'},
+            'direction': {'type': 'string', 'enum': ['in', 'out']},
+            'reason': {'type': 'string', 'description': '为什么要批量改，会显示在卡片上'},
+        }, 'required': ['entry_ids']}}},
     {'type': 'function', 'function': {
         'name': 'propose_delete_entries',
         'description': '删除流水的草稿（高危，用户必须在卡片上勾选确认才会执行）。'
@@ -1584,6 +1705,7 @@ WRITE_TOOLS = DEFS
 WRITE_IMPL = {
     'propose_entry': w_propose_entry,
     'propose_update_entry': w_propose_update,
+    'propose_update_entries': w_propose_update_bulk,
     'propose_delete_entries': w_propose_delete,
     'propose_merge_entries': w_propose_merge,
     'import_file': w_import_file,
@@ -1593,6 +1715,7 @@ WRITE_IMPL = {
 WRITE_LABELS = {
     'propose_entry': '写入一笔流水',
     'propose_update_entry': '修改流水',
+    'propose_update_entries': '批量修改流水',
     'propose_delete_entries': '起草删除',
     'propose_merge_entries': '起草合并',
     'import_file': '解析对账单',

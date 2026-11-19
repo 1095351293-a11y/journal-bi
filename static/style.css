@@ -716,3 +716,14 @@ body.agent-open.side-open #main{margin-right:calc(var(--agent-w) + 210px)}
   border-bottom:1px dashed #eef2f7}
 .merge-line:last-child{border-bottom:none}
 .merge-desc{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* 批量修改草稿卡 */
+.ag-bulk-tip{font-size:12px;color:#64748b;margin:2px 0 6px}
+.ag-bulk-tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.ag-bulk-tbl th{text-align:left;font-weight:600;color:#64748b;padding:4px 6px;
+  border-bottom:1px solid #e2e8f0;white-space:nowrap}
+.ag-bulk-tbl td{padding:4px 6px;border-bottom:1px solid #f1f5f9;vertical-align:top}
+.ag-bulk-chg{display:flex;flex-wrap:wrap;gap:2px 10px}
+.ag-chg-i{white-space:nowrap;color:#334155}
+.ag-chg-i s{color:#94a3b8;text-decoration:line-through}
+.ag-chg-i b{color:#0f766e}
