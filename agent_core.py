@@ -755,7 +755,11 @@ def run_agent_stream(cfg, sid, history, text, atts=None, company_id=None,
             pending = _has_pending(sid)
         except Exception:
             pending = False
-        route = route_intent(text, bool(d['facts']), bool(atts), pending)
+        # 会话事实缓存只在内存里，重启服务就没了；但前端会把历史一起带上来，
+        # 有历史就算「有上下文」，不然重启后用户再说一句「确认」又被判成
+        # 「基于已有结果」，写工具照样摘掉（2026-11-23 就是这么踩到的）。
+        has_ctx = bool(d['facts']) or bool(history)
+        route = route_intent(text, has_ctx, bool(atts), pending)
         # 斜杠调用技能时直接用 agent 模式：要跑脚本、要读说明，
         # 被意图正则判成「基于已有结果」就只剩几个只读工具，等于没调起来。
         if force_agent:
