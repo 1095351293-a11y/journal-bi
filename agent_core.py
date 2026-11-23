@@ -126,6 +126,13 @@ def route_intent(text, has_facts=False, has_atts=False, has_pending=False):
         # 这轮只是答应执行。不能当聊天短句处理，否则写工具被摘掉，
         # 模型只能承认自己干不了（见 docs/ISSUES.md 2026-11-23）。
         return {'mode': 'agent', 'tools': None, 'write': True}
+    if (has_facts and len(t) <= 14 and not _RE_CANCEL.search(t)
+            and not _RE_CAP.search(t) and not _RE_GREET.match(t)):
+        # 短句在长对话里几乎都是在接着上一轮干活：「做账」「是的」「记录」
+        # 「写入」「6 笔全记」。靠动词白名单认不出来就降级成只读轮次，
+        # 写工具整层消失、模型只能反问 —— 2026-11-23 连着踩了两次，
+        # 所以这里不再猜动词，短句有上下文就按 agent 轮给全工具。
+        return {'mode': 'agent', 'tools': None, 'write': True}
     if _RE_GREET.match(t):
         return {'mode': 'direct', 'tools': [],
                 'reply': '在。账上的事直接问我——余额、某笔流水、月度收支、大额支出、'
