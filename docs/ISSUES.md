@@ -20,9 +20,10 @@
   - `_RE_WRITE` 补「删了 / 删一 / 重记 / 重新记 / 再记一遍 / 再做一遍」。
   - `perm_block(has_write)` / `build_system(..., has_write=)`：把「这一轮有没有写工具」告诉模型。`full` 模式下若是查询轮次，明确写「是轮次裁剪，不是权限关闭，别自称没有写入通道，请用户补一句带动作的话」。
   - `run_agent_stream()` 里先算工具面、再拼提示词（原来顺序反了，提示词拿不到这个信息）。
+  - 会话事实缓存只在内存，重启即空；路由判据改成「有事实缓存**或**有前端带上来的历史」就算有上下文，否则重启后一句「确认」照样被降级。
 - **涉及**：`agent_core.py`（`_RE_AFFIRM`、`_RE_WRITE`、`route_intent`、`perm_block`、`build_system`、`run_agent_stream`）
 - **验证**：`route_intent('确认', has_facts=True)` → `agent`；「好的，开始吧」「照这个执行」「把这两笔删了重记」→ `agent`；「我是谁」仍 `context`、「好的」仍 `direct`；`agent` 轮 47 个工具含 `propose_entry`，`context` 轮 20 个读工具。
-- **提交**：本次
+- **提交**：`b50218f`、`3027bfd`
 
 ### 17. 只读模式能跑技能 → 技能里的写工具照样落库
 
