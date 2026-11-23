@@ -10,6 +10,10 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 TMP = tempfile.mkdtemp(prefix='biperm_')
 shutil.copy(os.path.join(BASE, 'data', 'journal.db'), os.path.join(TMP, 'journal.db'))
 os.makedirs(os.path.join(TMP, 'uploads'), exist_ok=True)
+# 临时目录里没有 agent_perm.json 时会落到默认的 ask 模式，后面「直写」断言必然失败。
+# 这份自测本来就是要验 full（全部放行）下的闸门，所以先把模式写进隔离环境。
+with open(os.path.join(TMP, 'agent_perm.json'), 'w', encoding='utf-8') as f:
+    json.dump({'mode': 'full'}, f)
 os.environ['JOURNAL_DATA_DIR'] = TMP
 os.environ['NO_BROWSER'] = '1'
 sys.path.insert(0, BASE)

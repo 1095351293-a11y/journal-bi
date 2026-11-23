@@ -876,6 +876,8 @@ WRITE_NAMES = {'propose_entry', 'propose_update_entry', 'propose_update_entries'
                'delete_attachment', 'backup_now',
                # 跑脚本 = 这台机器上真的起进程，只读模式一定不能下发
                'run_script', 'check_script',
+               # 技能：run_skill 会把步骤里的写工具一起跑掉，建/删技能落盘也算写
+               'run_skill', 'create_skill', 'delete_skill',
                # 票据打印：填单、删单、挪坐标都算写
                'create_print_record', 'update_print_record', 'delete_print_record',
                'update_print_field', 'create_print_template', 'delete_print_template'}

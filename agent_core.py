@@ -66,13 +66,20 @@ _RE_WRITE = re.compile(
     r'(去掉|删掉|清除|清空|取消).{0,8}(标签|标记)|'
     r'(也|再|都|全部|另外).{0,6}(加上|加个|挂上|贴上|标上|打上|去掉|删掉)|'
     r'合并|合成一笔|并成一笔|加起来记|归成一笔|'
-    r'删掉|删除|去掉这|移除这|作废这|重复了|'
+    r'删掉|删除|删了|删一|去掉这|移除这|作废这|重复了|'
     r'导入|批量加|批量录|把.{0,10}(对账单|账单|表).{0,6}(导入|录|记)|'
     # 对着上一张草稿提意见、要求重来：这些说法同样要挂写工具
-    r'重新(改|写|来|做|生成|起)|再改|改一下|改改|换个(说法|金额|日期|账户|摘要)|'
+    r'重新(改|写|来|做|生成|起)|重记|重新记|再记一遍|再做一遍|再改|改一下|改改|'
+    r'换个(说法|金额|日期|账户|摘要)|'
     r'换一个|不对|不满意|不准确|写错|填错|弄错|刚才那(个|笔)|重新起草)')
 _RE_NO_WRITE = re.compile(r'(导出|下载|打印|怎么记|如何记|能不能记|可以记)')
 _RE_CANCEL = re.compile(r'(算了|不用了|先不用|取消|不要了|不改了|别改|撤销掉?)')
+# 纯答应/催促类短句：上下轮已经说清了要做什么，用户只回一句「确认」「开始吧」。
+# 这种句子既没有写入动词、也没有数据关键词，以前会被判成「基于已有结果」，
+# 写工具整层被摘掉，模型只能回「我没有写入通道」——见 docs/ISSUES.md 2026-11-23。
+_RE_AFFIRM = re.compile(
+    r'(确认|确定|同意|没问题|开始|执行|照做|就这样|这么办|按这个|照这个|照这个来|'
+    r'按你说的|照你说的|动手|干吧|办吧|继续|来吧|可以的|行吧|对|可以)', re.I)
 # 出现这些词，说明问题本身定义了新的数据范围，不能只靠已有事实回答
 _RE_SCOPE = re.compile(
     r'(\d{4}\s*[-/年]\s*\d{1,2}|\d{1,2}\s*月|本月|这个月|上个?月|今年|去年|'
@@ -111,6 +118,13 @@ def route_intent(text, has_facts=False, has_atts=False, has_pending=False):
     if (has_pending and not _RE_CANCEL.search(t) and not _RE_CAP.search(t)
             and not _RE_GREET.match(t)):
         # 还有草稿没处理：用户大概率是在提修改意见，写工具继续挂着
+        return {'mode': 'agent', 'tools': None, 'write': True}
+    if (len(t) <= 16 and _RE_AFFIRM.search(t) and (has_pending or has_facts)
+            and not _RE_CANCEL.search(t) and not _RE_CAP.search(t)
+            and not _RE_GREET.match(t)):
+        # 「确认」「那就开始吧」「照这个执行」——上一轮已经说清了要做什么，
+        # 这轮只是答应执行。不能当聊天短句处理，否则写工具被摘掉，
+        # 模型只能承认自己干不了（见 docs/ISSUES.md 2026-11-23）。
         return {'mode': 'agent', 'tools': None, 'write': True}
     if _RE_GREET.match(t):
         return {'mode': 'direct', 'tools': [],
@@ -393,11 +407,22 @@ def pending_block(sid):
             '不能只回复「已修改」。')
 
 
-def perm_block():
-    """把当前权限策略告诉模型，它才知道自己能不能直接落库。"""
+def perm_block(has_write=True):
+    """把当前权限策略告诉模型，它才知道自己能不能直接落库。
+
+    ``has_write`` 为 False 时说明这一轮没挂写工具（查询/加工轮次），
+    要明确告诉模型这是「这一轮」的事，别升级成「我没有写权限」。
+    """
     try:
-        from agent_perm import describe
-        return '\n\n## 你当前的权限\n' + describe()
+        from agent_perm import allow_write_tools, describe
+        txt = '\n\n## 你当前的权限\n' + describe()
+        if allow_write_tools() and not has_write:
+            txt += ('\n\n**本轮工具面**：这一轮按查询 / 加工处理，工具清单里只有读工具，'
+                    '写入工具（propose_*、manage_* 等）这一轮没挂上——是轮次裁剪，'
+                    '不是权限关闭。用户这时要求改账，就把要做的事复述一遍，'
+                    '请他补一句带动作的话（如「删掉这两笔」「新增这两笔」）再执行；'
+                    '**绝不要说「我没有写入通道 / 我永远改不了」**。')
+        return txt
     except Exception:
         return ''
 
@@ -461,12 +486,12 @@ def mcp_block():
     return '\n'.join(lines)
 
 
-def build_system(sid, company, att_block=''):
+def build_system(sid, company, att_block='', has_write=True):
     try:
         tmpl = load_system_template()
     except Exception:
         tmpl = ''
-    extra = ((att_block or '') + perm_block() + facts_block(sid)
+    extra = ((att_block or '') + perm_block(has_write) + facts_block(sid)
              + pending_block(sid) + skill_block() + mcp_block())
     out = tmpl.replace('{today}', date.today().isoformat())
     out = out.replace('{company}', company or '（未设置）')
@@ -750,20 +775,25 @@ def run_agent_stream(cfg, sid, history, text, atts=None, company_id=None,
                    'usage': {'total_tokens': 0}}
             return
 
+        # 全权限：进入 agent 模式就挂上全部工具（查询 + 写入 + 系统维护），
+        # 由模型按用户意图自选，不再按关键词裁剪工具面。
+        # context 模式（「把刚才那个整理成表格」这类）以前不给任何工具，
+        # 结果模型想补查一笔时无从下手、只能反问 —— 现在给只读工具兜底。
+        # 先算工具面再拼提示词：这一轮到底有没有写工具，得让模型知道，
+        # 否则它会把自己「这一轮没工具」说成「我永远没有写入通道」。
+        tools = (pick_tools(None, True) if route['mode'] == 'agent'
+                 else pick_tools(route.get('tools') or None, False))
+        has_write = any(t['function']['name'] in WRITE_NAMES for t in tools)
+
         # 历史 + 本轮输入
         messages = [{'role': 'system',
-                     'content': build_system(sid, _company_block(company_id))}]
+                     'content': build_system(sid, _company_block(company_id),
+                                             has_write=has_write)}]
         for h in compact_history(history):
             messages.append({'role': h['role'], 'content': h['content']})
         messages.append({'role': 'user',
                          'content': build_user_content(text, atts, cfg)})
 
-        # 全权限：进入 agent 模式就挂上全部工具（查询 + 写入 + 系统维护），
-        # 由模型按用户意图自选，不再按关键词裁剪工具面。
-        # context 模式（「把刚才那个整理成表格」这类）以前不给任何工具，
-        # 结果模型想补查一笔时无从下手、只能反问 —— 现在给只读工具兜底。
-        tools = (pick_tools(None, True) if route['mode'] == 'agent'
-                 else pick_tools(route.get('tools') or None, False))
         usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
         auto_links, pushed_links = [], []
         emitted_proposal = False

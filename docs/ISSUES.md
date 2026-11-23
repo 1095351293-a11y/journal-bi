@@ -5,6 +5,36 @@
 
 ---
 
+## 2026-11-23
+
+### 16.「确认」之后 AI 说自己没有写入通道，只能让用户手工记
+
+- **现象**：完全访问模式下，AI 上一轮把方案说清楚了（删 2 笔 + 补记 2 笔），用户回一句「确认」，AI 却答「我当前可用的工具只有查询、汇总、导出、打印模板，没有删除流水和起草记账的写入通道」，连续两轮都不肯动手；界面顶部还标着「基于已有结果」。
+- **原因**：不是权限问题（`/api/agent/mode` 返回 `full`），是**意图路由把这一轮判成了 `context`**。
+  - `route_intent()` 只看关键词：`_RE_WRITE`（写入动词）没命中、`_RE_DATA`/`_RE_AGG`（数据词）也没命中、句子又短（≤30 字），于是落到「基于已有结果」分支，返回 `tools: []`。
+  - `run_agent_stream()` 里只有 `route['mode'] == 'agent'` 才 `pick_tools(None, True)`（全工具）；`context` 走 `pick_tools(..., False)`，`allow_write=False` 会把 `WRITE_NAMES` 里的工具整层剥掉，只剩 20 个读工具（查询 / 聚合 / 导出 / 打印模板）——和 AI 自述的工具面完全一致。
+  - 同理「把这两笔删了重记」「好的，开始吧」也只被判成 `context`：`_RE_WRITE` 只认「删掉 / 删除」，不认「删了」「重记」。
+  - 另外提示词里只写了「当前是完全访问模式」，没说「这一轮没挂写工具」，模型只能把「这一轮没有」升级成「我永远没有」。
+- **解决**：
+  - 新增 `_RE_AFFIRM`（确认 / 确定 / 同意 / 没问题 / 开始 / 执行 / 照这个 / 就这样 / 按你说的 …）+ 判据：`len(t) <= 16` 且 `has_pending or has_facts`（有草稿或上下文里已有查询结果）且不是取消 / 能力询问 / 寒暄，就按 `agent` 走，挂全工具。
+  - `_RE_WRITE` 补「删了 / 删一 / 重记 / 重新记 / 再记一遍 / 再做一遍」。
+  - `perm_block(has_write)` / `build_system(..., has_write=)`：把「这一轮有没有写工具」告诉模型。`full` 模式下若是查询轮次，明确写「是轮次裁剪，不是权限关闭，别自称没有写入通道，请用户补一句带动作的话」。
+  - `run_agent_stream()` 里先算工具面、再拼提示词（原来顺序反了，提示词拿不到这个信息）。
+- **涉及**：`agent_core.py`（`_RE_AFFIRM`、`_RE_WRITE`、`route_intent`、`perm_block`、`build_system`、`run_agent_stream`）
+- **验证**：`route_intent('确认', has_facts=True)` → `agent`；「好的，开始吧」「照这个执行」「把这两笔删了重记」→ `agent`；「我是谁」仍 `context`、「好的」仍 `direct`；`agent` 轮 47 个工具含 `propose_entry`，`context` 轮 20 个读工具。
+- **提交**：本次
+
+### 17. 只读模式能跑技能 → 技能里的写工具照样落库
+
+- **现象**：只读模式下 `run_skill` 仍在下发，技能步骤里如果编排了 `manage_*` / 导入类工具，会绕过模式闸门执行；`delete_skill` 也能删盘上的技能文件。
+- **原因**：`WRITE_NAMES` 漏了 `run_skill`、`create_skill`、`delete_skill`（只收了 `run_script`、`check_script`）。
+- **解决**：三个名字补进 `WRITE_NAMES`；顺手修 `_perm_selftest.py`——它在临时数据目录里没写 `agent_perm.json`，会落到默认 `ask` 模式，「直写」断言必挂，现在先把 `{"mode":"full"}` 写进隔离环境。
+- **涉及**：`agent.py`（`WRITE_NAMES`）、`_perm_selftest.py`
+- **验证**：只读池 20 个工具，无任何 `WRITE_NAMES` 成员；`tools/test_agent_print.py` 36 项全过；`_perm_selftest.py` 全部断言通过（全程在临时目录，不碰 `data/journal.db`）。
+- **提交**：本次
+
+---
+
 ## 2026-11-19
 
 ### 10. 票据打印预览太小，A4 单子看不清（加缩放）
